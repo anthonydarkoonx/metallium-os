@@ -56,6 +56,10 @@ pub const OBJ_GPU_CMD: u16 = 17;
 pub const OBJ_GPU_FB: u16 = 18;
 /// 1024 x 768 pixels of 4 bytes, physically contiguous.
 pub const FB_PAGES: usize = 768;
+/// The framebuffers of the other ttys (docs/MULTIUSER-PLAN.md, *TTYs*): 1024 x 768 each, like `OBJ_GPU_FB`, which is tty 0's. Made only where sessions run (the interactive boot, `only=15`):
+/// three more are 9 MiB, which a test machine of 64 MiB does not spare.
+pub const OBJ_GPU_FB1: u16 = 28;
+pub const TTY_BUFFERS: usize = 4;
 /// The keyboard: registers, config copy, and one page holding its event queue and buffers.
 pub const OBJ_KBD_MMIO: u16 = 19;
 pub const OBJ_KBD_PCICFG: u16 = 20;

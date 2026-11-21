@@ -347,7 +347,11 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                 install(t, tid, 11, Kind::MemCtl, 0, R_MEM_STATS | R_MEM_ALLOC | R_MEM_SWAP | R_MEM_PAGER | R_GRANT); // (grant: the memory-limit tests hand it to a program)
                 // conductor may start each benchmark client and read their results (not in the interactive boot, which runs no benchmarks: its slots stay free, for the session service to hand
                 // the conductor a session's manager endpoint)
-                if !crate::platform::interactive() {
+                if crate::platform::only() == 15 {
+                    // (`make tty-test`: the conductor draws into two ttys' buffers and has the display driver switch between them)
+                    install(t, tid, 16, Kind::Memory, obj::OBJ_GPU_FB1, R_MAP | R_WRITE);
+                    install(t, tid, 17, Kind::Memory, obj::OBJ_GPU_FB1 + 1, R_MAP | R_WRITE);
+                } else if !crate::platform::interactive() {
                     for k in 0..ipc::BENCH_PAIRS {
                         install(t, tid, 16 + k, Kind::Endpoint, ipc::EP_BENCH_GO + k as u16, R_SEND);
                     }
@@ -375,7 +379,7 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                 // chaos mode: the conductor drives a workload against every service and starts the monkey
                 install(t, tid, 14, Kind::Endpoint, ipc::EP_KBD, R_SEND);
                 install(t, tid, 22, Kind::Endpoint, ipc::EP_MONKEY, R_SEND);
-            } else if crate::platform::only() == 10 {
+            } else if matches!(crate::platform::only(), 10 | 15) {
                 install(t, tid, 14, Kind::Endpoint, ipc::EP_KBD, R_SEND); // (the USB input test: the conductor waits for input the way a desktop does)
             }
             if obj::gpu_present() {
@@ -385,7 +389,11 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
             }
         }
         // the input driver serves its endpoint whichever devices it found (virtio-input, a USB controller, or both)
-        14 => install(t, tid, 0, Kind::Endpoint, ipc::EP_KBD, R_RECV),
+        14 => {
+            install(t, tid, 0, Kind::Endpoint, ipc::EP_KBD, R_RECV);
+            // the display driver: the input driver tells it which tty's buffer to show when Ctrl+Alt+F1..F12 is pressed (it is the one task besides the conductor the display driver obeys)
+            install(t, tid, 11, Kind::Endpoint, ipc::EP_GPU, R_SEND);
+        }
         1 => install(t, tid, 0, Kind::Endpoint, ipc::EP_SERVICE, R_RECV),
         2 => install(t, tid, 0, Kind::Endpoint, ipc::EP_DRIVER, R_RECV),
         9 => install(t, tid, 0, Kind::MemCtl, 0, R_MEM_STATS | R_MEM_COMPACT | R_MEM_SWAP), // compactd

@@ -34,7 +34,9 @@ const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 /// VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: a pixel is the 32-bit word 0x00RRGGBB.
 const FORMAT_B8G8R8X8: u32 = 2;
-const RESOURCE: u32 = 1;
+/// Buffer `b` is virtio resource `b + 1`, mapped at handle `FB_VA + b * FB_STRIDE` (the driver's slot 4 for buffer 0, 7.. for the others).
+const FB_STRIDE: usize = 0x40_0000;
+const MAX_BUFFERS: usize = 4;
 
 fn put32(off: usize, v: u32) {
     // SAFETY: CMD_VA is the command page mapped read-write (mem_map in gpu_init); callers use offsets < RESP + response size, well inside 4096 bytes.
@@ -55,6 +57,9 @@ struct Gpu {
     cmd_pa: u64,
     fb_pa: u64,
     host_enabled: u32,
+    /// How many buffers there are (1 unless the machine runs sessions) and which one is on the screen.
+    buffers: usize,
+    active: usize,
 }
 
 impl Gpu {
@@ -138,10 +143,8 @@ impl Gpu {
     /// Copy a rectangle of the backing store to the host.
     fn transfer(&mut self, id: u32, x: usize, y: usize, w: usize, h: usize) -> bool {
         // the device reads the rectangle from memory: what the screen task drew must have left the CPU's caches
-        // (only the resource this driver itself backs with the framebuffer is mapped here: id 1)
-        if id == RESOURCE {
-            metallium_driver_rt::dma::clean(va(FB_VA) + (y * W + x) * 4, ((h - 1) * W + w) * 4);
-        }
+        // (every resource this driver backs is one of its mapped buffers: id = buffer + 1)
+        metallium_driver_rt::dma::clean(va(FB_VA + (id as usize - 1) * FB_STRIDE) + (y * W + x) * 4, ((h - 1) * W + w) * 4);
         self.begin(CMD_TRANSFER_TO_HOST_2D);
         self.rect(24, x, y, w, h);
         put64(40, ((y * W + x) * 4) as u64); // where the rectangle's first pixel is in the backing store
@@ -190,7 +193,7 @@ fn gpu_init() -> Result<Gpu, &'static str> {
     }
     let q = pci.queue(0, 8, va(QUEUE_VA), queue_pa)?; // queue 0 is the control queue
     pci.driver_ok();
-    let mut g = Gpu { pci, q, cmd_pa, fb_pa, host_enabled: 0 };
+    let mut g = Gpu { pci, q, cmd_pa, fb_pa, host_enabled: 0, buffers: 1, active: 0 };
 
     g.begin(CMD_GET_DISPLAY_INFO);
     if g.send(24, 24 + 16 * 24) != RESP_OK_DISPLAY_INFO {
@@ -198,10 +201,21 @@ fn gpu_init() -> Result<Gpu, &'static str> {
     }
     let (host_w, host_h, enabled) = (get32(RESP + 32), get32(RESP + 36), get32(RESP + 40));
     g.host_enabled = enabled;
-    if !g.create(RESOURCE, W, H) || !g.attach(RESOURCE, fb_pa, FB_BYTES) || !g.scanout(RESOURCE, W, H) {
+    if !g.create(1, W, H) || !g.attach(1, fb_pa, FB_BYTES) || !g.scanout(1, W, H) {
         return Err("could not set up the scanout");
     }
-    println!("[gpu] scanout {W}x{H} ready (host reports {host_w}x{host_h}, enabled={enabled})");
+    // the other ttys' buffers, where the machine has them (the kernel makes them only where sessions run): each its own resource, none on the screen yet
+    for b in 1..MAX_BUFFERS {
+        if mem_map(7 + b as u64 - 1, FB_VA + b * FB_STRIDE, true) != 0 {
+            break;
+        }
+        let (s, pa, pages, _) = cap_info(7 + b as u64 - 1);
+        if s != 0 || (pages as usize) * 4096 < FB_BYTES || !g.create(b as u32 + 1, W, H) || !g.attach(b as u32 + 1, pa, FB_BYTES) {
+            return Err("could not set up a tty's buffer");
+        }
+        g.buffers = b + 1;
+    }
+    println!("[gpu] scanout {W}x{H} ready (host reports {host_w}x{host_h}, enabled={enabled}), {} buffer(s)", g.buffers);
     Ok(g)
 }
 
@@ -216,14 +230,21 @@ pub fn gpu_driver() -> ! {
     };
     loop {
         let m = recv(0);
-        match m.w[0] {
+        let (op, buffer) = (m.w[0] & 0xFF, (m.w[0] >> BUFFER_SHIFT) as usize & 0xFF);
+        // a present names its tty's buffer (0 when it says nothing); one that is not on the screen is copied to the host, not shown
+        let res = buffer as u32 + 1;
+        let shown = buffer == g.active;
+        match op {
+            GPU_FLUSH | GPU_FLUSH2 if buffer >= g.buffers => {
+                reply([1, 0, 0]);
+            }
             GPU_FLUSH => {
                 let (x, y, w, h) = (m.w[1] as usize & 0xffff, (m.w[1] >> 16) as usize & 0xffff, (m.w[1] >> 32) as usize & 0xffff, (m.w[1] >> 48) as usize);
                 if w == 0 || h == 0 || x + w > W || y + h > H {
                     reply([1, 0, 0]);
                     continue;
                 }
-                let ok = g.present(RESOURCE, x, y, w, h);
+                let ok = if shown { g.present(res, x, y, w, h) } else { g.transfer(res, x, y, w, h) };
                 reply([!ok as u64, 0, 0]);
             }
             GPU_FLUSH2 => {
@@ -238,16 +259,39 @@ pub fn gpu_driver() -> ! {
                 let mut ok = true;
                 let (mut x0, mut y0, mut x1, mut y1, mut any) = (W, H, 0, 0, false);
                 for r in rects.iter().filter(|r| valid(r)) {
-                    ok &= g.transfer(RESOURCE, r.0, r.1, r.2, r.3);
+                    ok &= g.transfer(res, r.0, r.1, r.2, r.3);
                     (x0, y0, x1, y1, any) = (x0.min(r.0), y0.min(r.1), x1.max(r.0 + r.2), y1.max(r.1 + r.3), true);
                 }
-                if ok && any {
-                    ok = g.flush(RESOURCE, x0, y0, x1 - x0, y1 - y0);
+                if ok && any && shown {
+                    ok = g.flush(res, x0, y0, x1 - x0, y1 - y0);
                 }
                 reply([!ok as u64, 0, 0]);
             }
             GPU_INFO => {
-                reply([W as u64 | (H as u64) << 32, g.host_enabled as u64, 0]);
+                reply([W as u64 | (H as u64) << 32, g.host_enabled as u64, g.buffers as u64]);
+            }
+            GPU_SCANOUT => {
+                // the tty switch is the input driver's (it sees Ctrl+Alt+F1..F12 first); the conductor (task 0) stands in for it in `make tty-test`
+                let role = sysinfo_at(3, m.sender)[5];
+                if m.sender != 0 && role != 14 {
+                    reply([2, 0, 0]);
+                    continue;
+                }
+                let b = m.w[1] as usize;
+                if b >= g.buffers {
+                    reply([1, 0, 0]);
+                    continue;
+                }
+                // the buffer shown is whole: copy all of it, then point the scanout at it
+                let ok = g.transfer(b as u32 + 1, 0, 0, W, H) && g.scanout(b as u32 + 1, W, H) && g.flush(b as u32 + 1, 0, 0, W, H);
+                if ok {
+                    g.active = b;
+                    println!("[gpu] tty {b} is in front");
+                }
+                reply([!ok as u64, 0, 0]);
+            }
+            GPU_ACTIVE => {
+                reply([g.active as u64, g.buffers as u64, 0]);
             }
             GPU_STALL => {
                 if m.sender != 0 {
@@ -271,7 +315,7 @@ pub fn gpu_driver() -> ! {
                 // this never replies.
                 let target = g.fb_pa + (FB_BYTES.div_ceil(4096) * 4096) as u64 + 0x1000;
                 println!("[gpu] misbehaving: pointing the device at memory outside my grant ({target:#x})");
-                let ok = g.create(2, 16, 16) && g.attach(2, target, 16 * 16 * 4) && g.present(2, 0, 0, 16, 16);
+                let ok = g.create(9, 16, 16) && g.attach(9, target, 16 * 16 * 4) && g.present(9, 0, 0, 16, 16);
                 reply([ok as u64, 0, 0]); // only reached if the DMA was NOT blocked
             }
             _ => {

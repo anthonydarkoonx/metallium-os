@@ -119,6 +119,10 @@ fn client() -> ! {
             programs::scale_tests(); // make scale: every slot of a table of 1024 tasks
             exit(0)
         }
+        15 => {
+            programs::tty_test(); // make tty-test: two ttys' buffers and the display driver's switch between them
+            exit(0)
+        }
         14 => {
             programs::greeter_test(); // make greeter-test: the greeter's screens, driven by the harness
             exit(0)

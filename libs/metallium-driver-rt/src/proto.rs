@@ -30,6 +30,14 @@ pub mod gpu {
     /// Present up to two rectangles in one call: w1 and w2 are each `x | y << 16 | w << 32 | h << 48`; a zero rectangle is skipped.
     /// Both are copied to the host, then one flush covers the pair. Replies 0, or 1 if a rectangle is outside the screen.
     pub const GPU_FLUSH2: u64 = 34;
+    /// Which tty's buffer a present (`GPU_FLUSH`, `GPU_FLUSH2`) is for: put `buffer << 8` in w0 next to the op (0 is the first framebuffer, the one the machine boots with; a driver with
+    /// fewer buffers refuses a number it does not have). A buffer that is not on the screen is copied to the host but not shown: it is whole when its tty comes to the front.
+    pub const BUFFER_SHIFT: u64 = 8;
+    /// Show buffer w1 (the tty in front): `GPU_SCANOUT`. Only the input driver (which sees Ctrl+Alt+F1..F12 first) and the test conductor may ask; anyone else gets 2.
+    /// Replies 0, 1 for a buffer that does not exist, 2 for a refused caller.
+    pub const GPU_SCANOUT: u64 = 35;
+    /// Which buffer is on the screen: reply [buffer, number of buffers, 0]. `GPU_INFO`'s third word is the number of buffers too.
+    pub const GPU_ACTIVE: u64 = 36;
 }
 
 /// The data volume's lock (the data store server, role 6; the greeter and the other system tasks that hold its endpoint send these). Nothing else about the
@@ -78,6 +86,11 @@ pub mod input {
     /// The reply is the same; no events means the time ran out. The driver does nothing else while it waits (so one client should use it, and a
     /// `KBD_POLL` from another waits its turn).
     pub const INPUT_WAIT: u64 = 72;
+    /// Say which tty a task's input belongs to: `w[1]` = the task, `w[2]` = the tty (0..11). Only the conductor (task 0) may; the session service's registration is to come. A task
+    /// nobody assigned is on tty 0. Replies 0, or 1 for a refused caller or a bad number.
+    pub const INPUT_ASSIGN: u64 = 73;
+    /// Which tty is in front (the driver switches on Ctrl+Alt+F1..F12 and tells the display driver): reply [tty, 0, 0].
+    pub const INPUT_ACTIVE: u64 = 74;
 
     /// An input event, packed in a word: `kind` (low byte), `code` (next 16 bits), `value` (high 32 bits).
     pub mod ev {
@@ -90,6 +103,8 @@ pub mod input {
         pub const BUTTON: u64 = 3;
         /// The wheel, `value` = signed clicks (positive = away from the user).
         pub const WHEEL: u64 = 4;
+        /// Your tty has come to the front (`value` = the tty): repaint and present again. Sent to the tty's queue when it is switched to.
+        pub const FRONT: u64 = 5;
         pub fn pack(kind: u64, code: u16, value: i32) -> u64 {
             kind | (code as u64) << 8 | (value as u32 as u64) << 32
         }

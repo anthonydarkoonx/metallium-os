@@ -1566,3 +1566,67 @@ pub fn greeter_test() {
         sleep(1000);
     }
 }
+
+/// `make tty-test` (`opt/metallium/only=15`): the display driver has a buffer for each tty and shows the one it is told to. The conductor draws a red screen into tty 1's buffer and a blue one
+/// into tty 2's (neither is in front: tty 0 is, so the screen must not change), then asks the driver to show 1, 2, 0 (and refuses 4); tools/tty-test.py takes a screenshot of each stage through
+/// QMP and checks the colour. The screen task checks that a task other than the input driver and the conductor is refused.
+pub fn tty_test() {
+    use crate::proto::gpu::*;
+    sleep(30);
+    let (w, h) = (crate::gpu::W, crate::gpu::H);
+    let (a, b) = (mem_map(16, 0xBC00_0000, true), mem_map(17, 0xBC40_0000, true));
+    let info = call(21, [GPU_INFO, 0, 0]);
+    println!("[tty] TEST the display driver has a buffer for each of four ttys and the conductor holds two of them (maps {a} {b}, buffers {}): {}", info.1[2], verdict(a == 0 && b == 0 && info.1[2] == 4));
+    let paint = |va: usize, color: u32| {
+        // SAFETY: the mapping above is a whole framebuffer of `w * h` words, which only this task writes.
+        unsafe { core::slice::from_raw_parts_mut(va as *mut u32, w * h) }.fill(color);
+    };
+    paint(0xBC00_0000, 0x00FF_0000);
+    paint(0xBC40_0000, 0x0000_00FF);
+    let full = (w as u64) << 32 | (h as u64) << 48;
+    let (s1, s2) = (call(21, [GPU_FLUSH2 | 1 << BUFFER_SHIFT, full, 0]), call(21, [GPU_FLUSH2 | 2 << BUFFER_SHIFT, full, 0]));
+    println!("[tty] TEST drawing into the buffers of ttys that are not in front is accepted (status {} {}): {}", s1.1[0], s2.1[0], verdict(s1.0 == 0 && s1.1[0] == 0 && s2.0 == 0 && s2.1[0] == 0));
+    let bad = call(21, [GPU_FLUSH2 | 4 << BUFFER_SHIFT, full, 0]);
+    println!("[tty] TEST a buffer that does not exist is refused (reply {}): {}", bad.1[0], verdict(bad.1[0] == 1));
+    println!("[tty] hidden: ttys 1 and 2 are drawn, tty 0 is in front");
+    sleep(300);
+    for t in [1u64, 2, 0] {
+        let r = call(21, [GPU_SCANOUT, t, 0]);
+        let act = call(21, [GPU_ACTIVE, 0, 0]);
+        println!("[tty] TEST the driver switches to tty {t} (reply {}, in front {}): {}", r.1[0], act.1[0], verdict(r.0 == 0 && r.1[0] == 0 && act.1[0] == t));
+        println!("[tty] showing {t}");
+        sleep(300);
+    }
+    let r = call(21, [GPU_SCANOUT, 4, 0]);
+    println!("[tty] TEST a tty that does not exist cannot be switched to (reply {}): {}", r.1[0], verdict(r.1[0] == 1));
+    // input: the conductor plays tty 2's desktop. It is given tty 2's input, and polls for 15 s while tools/tty-test.py types a key, switches to tty 2 (Ctrl+Alt+F3), types, switches back
+    // (Ctrl+Alt+F1) and types again: only the key typed while tty 2 was in front may arrive, and no F-key (press or release) at all.
+    use crate::proto::input::*;
+    let assign = call(14, [INPUT_ASSIGN, 0, 2]);
+    println!("[tty] TEST the conductor is given tty 2's input (reply {}): {}", assign.1[0], verdict(assign.0 == 0 && assign.1[0] == 0));
+    println!("[tty] input: start");
+    let (mut chars, mut fkeys, mut fronts) = (alloc::string::String::new(), 0, 0);
+    for _ in 0..1500 {
+        let (st, r) = call(14, [KBD_POLL, 0, 0]);
+        if st == 0 {
+            for i in 0..(r[0] & 0xFF).min(16) {
+                chars.push((r[1 + i as usize / 8] >> (8 * (i % 8))) as u8 as char);
+            }
+        }
+        let (st, r) = call(14, [INPUT_POLL, 0, 0]);
+        if st == 0 {
+            for i in 0..(r[0] & 0xFF).min(2) as usize {
+                let (kind, code) = (r[1 + i] & 0xFF, (r[1 + i] >> 8) & 0xFFFF);
+                fronts += (kind == ev::FRONT) as u32;
+                fkeys += (kind == ev::KEY && matches!(code, 59..=68 | 87 | 88)) as u32;
+            }
+        }
+        sleep(1);
+    }
+    println!("[tty] input saw: \"{chars}\", {fkeys} function key event(s), {fronts} front event(s)");
+    println!("[tty] TEST only the key typed while tty 2 was in front arrived, no function key reached it, and it was told once that it came to the front: {}", verdict(chars == "y" && fkeys == 0 && fronts == 1));
+    println!("[tty] done");
+    loop {
+        sleep(1000);
+    }
+}

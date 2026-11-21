@@ -150,8 +150,12 @@ pub static DRIVERS: [Driver; 7] = [
         cap(4, Kind::Memory, OBJ_GPU_FB, DEV),
         cap(5, Kind::Irq, IRQ_GPU, R_RECV),
         cap(6, Kind::Memory, OBJ_GPU_PCICFG, R_MAP),
+        // the other ttys' framebuffers (absent, and so not mapped by the driver, unless the machine runs sessions)
+        cap(7, Kind::Memory, OBJ_GPU_FB1, DEV),
+        cap(8, Kind::Memory, OBJ_GPU_FB1 + 1, DEV),
+        cap(9, Kind::Memory, OBJ_GPU_FB1 + 2, DEV),
     ],
-        dma: &[OBJ_GPU_QUEUE, OBJ_GPU_CMD, OBJ_GPU_FB],
+        dma: &[OBJ_GPU_QUEUE, OBJ_GPU_CMD, OBJ_GPU_FB, OBJ_GPU_FB1, OBJ_GPU_FB1 + 1, OBJ_GPU_FB1 + 2],
         tasks: &[
         task(12, "gpu-driver", SchedClass::Interactive, true, 1, Phase::Drivers, None),
         task(13, "console", SchedClass::Interactive, true, 1, Phase::Console, None), // (the VFS server finds it by its role)
@@ -407,6 +411,12 @@ fn setup_gpu(_f: &pci::Func, d: &Exposed) {
     set(OBJ_GPU_CMD, ObjKind::Dma, mem::alloc(mem::OWNER_KERNEL).expect("gpu command page"), 1, 0);
     let fb = mem::alloc_contig(FB_PAGES, mem::OWNER_KERNEL).expect("framebuffer");
     set(OBJ_GPU_FB, ObjKind::Dma, fb, FB_PAGES, 0);
+    if crate::platform::interactive() || crate::platform::only() == 15 {
+        for k in 0..TTY_BUFFERS - 1 {
+            let fb = mem::alloc_contig(FB_PAGES, mem::OWNER_KERNEL).expect("tty framebuffer");
+            set(OBJ_GPU_FB1 + k as u16, ObjKind::Dma, fb, FB_PAGES, 0);
+        }
+    }
     irq::register(IRQ_GPU as usize, d.irq_id);
 }
 

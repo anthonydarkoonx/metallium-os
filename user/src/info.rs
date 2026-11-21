@@ -77,6 +77,11 @@ pub fn info_task() -> ! {
     }
     let fb = va(FB_VA) as *mut u32;
     crate::greeter::unlock_screen(fb); // (an encrypted, locked data volume: ask for the passphrase before anything else)
+    if sysinfo(2)[3] == 15 {
+        // (`make tty-test`: a task that is neither the input driver nor the conductor may not switch the screen)
+        let r = call(1, [crate::proto::gpu::GPU_SCANOUT, 1, 0]);
+        println!("[tty] TEST the screen task may not switch ttys (reply {}): {}", r.1[0], verdict(r.1[0] == 2));
+    }
     println!("[shell] waiting for the display tests to finish");
     loop {
         let m = recv(0);

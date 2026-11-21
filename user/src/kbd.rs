@@ -34,6 +34,17 @@ const KEY_LALT: u16 = 56;
 const KEY_RALT: u16 = 100;
 const KEY_DELETE: u16 = 111;
 const KEY_ESC: u16 = 1;
+/// The display driver's endpoint (the input driver's slot 11): the driver tells it which tty's buffer to show.
+const GPU_SLOT: u64 = 11;
+/// F1..F12 as tty numbers 0..11 (the PC/AT numbers: F1..F10 are 59..68, F11 and F12 are 87 and 88).
+fn fkey(code: u16) -> Option<usize> {
+    match code {
+        59..=68 => Some((code - 59) as usize),
+        87 => Some(10),
+        88 => Some(11),
+        _ => None,
+    }
+}
 
 /// (unshifted, shifted) character for a key number; 0 for keys we do not map.
 pub fn map(code: u16) -> (u8, u8) {
@@ -100,9 +111,26 @@ struct Kbd {
     px: i32,
     py: i32,
     moved: bool,
+    /// The tty in front (its tasks get the input), the switch Ctrl+Alt+F<n> asked for that the main loop has not done yet, and the F-keys whose release is to be swallowed too.
+    active: usize,
+    switch: Option<usize>,
+    swallow: u16,
+    /// Which tty each task's input belongs to (`INPUT_ASSIGN`); a task that is not here is on tty 0.
+    assigned: [(u16, u8); 8],
 }
 
 impl Kbd {
+    fn tty_of(&self, task: u64) -> usize {
+        self.assigned.iter().find(|a| a.0 as u64 == task && a.0 != u16::MAX).map_or(0, |a| a.1 as usize)
+    }
+
+    /// Whatever is pending belongs to the tty that was in front: drop it, and tell the one coming to the front (so a desktop repaints).
+    fn switched(&mut self, tty: usize) {
+        self.active = tty;
+        (self.head, self.tail, self.ev_head, self.ev_len) = (0, 0, 0, 0);
+        self.push_event(ev::pack(ev::FRONT, 0, tty as i32));
+    }
+
     fn push(&mut self, c: u8) {
         let next = (self.tail + 1) % self.out.len();
         if next != self.head {
@@ -135,6 +163,22 @@ impl Kbd {
     }
 
     fn key(&mut self, code: u16, value: u32) {
+        // Ctrl+Alt+F1..F12 is the tty switch: the driver sees the keys first, does the switch itself and the keys reach no desktop (nor their release)
+        if let Some(n) = fkey(code) {
+            if value != 0 && self.ctrl && self.alt {
+                if value == 1 {
+                    self.switch = Some(n);
+                }
+                self.swallow |= 1 << n;
+                return;
+            }
+            if self.swallow & 1 << n != 0 {
+                if value == 0 {
+                    self.swallow &= !(1 << n);
+                }
+                return;
+            }
+        }
         self.push_event(ev::pack(ev::KEY, code, value as i32));
         match code {
             KEY_LSHIFT | KEY_RSHIFT => self.shift = value != 0,
@@ -332,6 +376,10 @@ fn kbd_init() -> Result<Kbd, &'static str> {
         px: 0,
         py: 0,
         moved: false,
+        active: 0,
+        switch: None,
+        swallow: 0,
+        assigned: [(u16::MAX, 0); 8],
     })
 }
 
@@ -354,13 +402,37 @@ pub fn kbd_driver() -> ! {
     loop {
         let m = recv(0);
         k.pump();
-        match m.w[0] {
-            KBD_POLL => reply(k.take()),
-            INPUT_POLL => reply(k.take_events()),
-            INPUT_WAIT => {
-                k.wait_events(m.w[1].min(1000));
-                reply(k.take_events())
+        if let Some(t) = k.switch.take() {
+            // the display driver does the switch (it answers 1 for a tty it has no buffer for: nothing changes then)
+            let (st, r) = call(GPU_SLOT, [crate::proto::gpu::GPU_SCANOUT, t as u64, 0]);
+            if st == 0 && r[0] == 0 && t != k.active {
+                k.switched(t);
+                println!("[kbd] tty {t} is in front");
             }
+        }
+        // a task gets input only while its tty is in front; the others see nothing (and go on asking: a desktop of a tty behind has nothing to do anyway)
+        let mine = k.tty_of(m.sender) == k.active;
+        match m.w[0] {
+            KBD_POLL if mine => reply(k.take()),
+            INPUT_POLL if mine => reply(k.take_events()),
+            INPUT_WAIT if mine => {
+                k.wait_events(m.w[1].min(1000));
+                // (a switch during the wait: whatever arrived is for the tty that is in front now)
+                if k.tty_of(m.sender) == k.active { reply(k.take_events()) } else { reply([0, 0, 0]) }
+            }
+            KBD_POLL | INPUT_POLL | INPUT_WAIT => reply([0, 0, 0]),
+            INPUT_ASSIGN => {
+                let (task, tty) = (m.w[1], m.w[2]);
+                let slot = k.assigned.iter().position(|a| a.0 as u64 == task || a.0 == u16::MAX);
+                match slot {
+                    Some(i) if m.sender == 0 && task < u16::MAX as u64 && tty < 12 => {
+                        k.assigned[i] = (task as u16, tty as u8);
+                        reply([0, 0, 0])
+                    }
+                    _ => reply([1, 0, 0]),
+                }
+            }
+            INPUT_ACTIVE => reply([k.active as u64, 0, 0]),
             _ => reply([0, 0, 0]),
         };
     }
