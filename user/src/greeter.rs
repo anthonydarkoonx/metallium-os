@@ -12,8 +12,8 @@ use crate::*;
 const SL_GPU: u64 = 1;
 const SL_KBD: u64 = 4;
 const SL_STORE: u64 = 30;
-/// The session service's endpoint (the screen task has a send right to it; nothing receives until a session service runs: only in `opt/metallium/only=14` (`make greeter-test`) one
-/// is started, so only there is the slot passed on: a call on an endpoint nobody receives on would wait for ever; 0 tells a greeter there is no service).
+/// The session service's endpoint (the screen task has a send right to it; nothing receives until a session service runs: one is started in the interactive boot and in `opt/metallium/only=14` (`make greeter-test`),
+/// so only there is the slot passed on: a call on an endpoint nobody receives on would wait for ever; 0 tells a greeter there is no service).
 const SL_SESSIONS: u64 = 29;
 
 /// How the volume is (`state`, flags), or `None` if the store cannot be asked.
@@ -65,8 +65,8 @@ fn present() {
 /// built-in prompt only unlocks a locked volume. `fb` is the W x H scanout buffer.
 pub fn unlock_screen(fb: *mut u32) {
     let locked = volume_status().map_or(false, |(s, _)| s == state::LOCKED);
-    // (a session service answers only in the test mode `only=14` for now: a call on an endpoint nobody receives on would wait for ever, so the slot is passed on only there)
-    let sessions = if sysinfo(2)[3] == 14 { SL_SESSIONS } else { 0 };
+    // (a session service is started in the interactive boot and in the test mode `only=14`: a call on an endpoint nobody receives on would wait for ever, so the slot is passed on only there)
+    let sessions = if sysinfo(2)[3] == 14 || (sysinfo(2)[1] != 0 && sysinfo(2)[3] == 0) { SL_SESSIONS } else { 0 };
     #[cfg(greeter)]
     if locked || sessions != 0 {
         println!("[greeter] handing the screen to the greeter");

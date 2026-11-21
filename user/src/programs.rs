@@ -473,6 +473,14 @@ pub fn console_session() -> ! {
         println!("[client] interactive session: program manager task {mgr}, control endpoint in the console's slot {ctl_slot}, display endpoint in {disp_slot}");
         // (the programs that come with the console - dock, launcher, files, task manager - return with the new GUI)
     }
+    // the session service (programs/src/bin/sessiond.rs): the greeter in the screen task logs users in through the conductor's static endpoint (slot 29)
+    let sessiond = v.read_file("/system/bin/sessiond").unwrap_or_default();
+    if sessiond.len() > 32 {
+        let rq = Req::new().fs().heap(4096).budget(8000).give_masked(0, 29, 0b111).give_masked(5, FACTORY_SLOT as u8, 0xFFFF).give_masked(6, SPAWN_SLOT as u8, 0xFFFF).give_masked(4, 7, 0xFFFF);
+        println!("[client] interactive session: session service task {}", rq.go(&sessiond));
+    } else {
+        println!("[client] interactive session: no session service in the system image");
+    }
     let w2 = (disp_slot.max(0) as u64 & 0xFF) | (mgr.max(0) as u64) << 8 | (power_slot.max(0) as u64 & 0xFF) << 16;
     let (st, _) = call(23, [crate::info::INFO_CONSOLE, ctl_slot.max(0) as u64, w2]);
     println!("[client] interactive session: the console has the screen (status {st})");

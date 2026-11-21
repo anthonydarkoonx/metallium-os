@@ -319,6 +319,11 @@ fn install(t: &mut Task, tid: usize, slot: usize, kind: Kind, obj: u16, rights: 
     }
 }
 
+/// The interactive boot (`make run-window`, no test mode) starts the session service: its endpoint is installed in the conductor and the screen task.
+fn sessions_in_boot() -> bool {
+    crate::platform::interactive() && crate::platform::only() == 0
+}
+
 /// Initial capabilities per role: the kernel's static "system policy".
 fn boot_caps(t: &mut Task, tid: usize, role: u8) {
     install(t, tid, crate::syscall::CONSOLE_SLOT, Kind::Console, 0, 0);
@@ -349,9 +354,9 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
             if obj::blk_present() {
                 // scheduler tests: start and stop the CPU burners, and reserve real-time shares
                 install(t, tid, 24, Kind::Memory, obj::OBJ_SHM_SPIN, R_MAP | R_WRITE);
-                if matches!(crate::platform::only(), 13 | 14) {
-                    // (the conductor starts the session service and hands it this endpoint: `make session-test`, `make greeter-test`. Only there: the conductor's capability table has no
-                    // free slot to spare, and the test that grants into its first free one must keep finding one)
+                if matches!(crate::platform::only(), 13 | 14) || sessions_in_boot() {
+                    // (the conductor starts the session service and hands it this endpoint: `make session-test`, `make greeter-test`, and the interactive boot. Not in the other
+                    // runs: the conductor's capability table has no free slot to spare there, and the test that grants into its first free one must keep finding one)
                     install(t, tid, 29, Kind::Endpoint, ipc::EP_SESSIONS, R_SEND | R_RECV | R_GRANT);
                 }
                 install(t, tid, 25, Kind::Sched, 0, R_RT);
@@ -431,8 +436,8 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
             // the right to unlock the encrypted data volume (the greeter asks for the passphrase and sends it here; the store accepts only the lock's calls from a task that
             // has no file page of its own, so this is no access to the files)
             install(t, tid, 30, Kind::Endpoint, ipc::EP_LFS, R_SEND);
-            if crate::platform::only() == 14 {
-                install(t, tid, 29, Kind::Endpoint, ipc::EP_SESSIONS, R_SEND); // (the greeter logs users in through it; for now only in `make greeter-test`, where a session service runs)
+            if crate::platform::only() == 14 || sessions_in_boot() {
+                install(t, tid, 29, Kind::Endpoint, ipc::EP_SESSIONS, R_SEND); // (the greeter logs users in through it; only where the conductor starts a session service)
             }
             // the shell starts programs, with file access and a standard-output endpoint it creates itself
             install(t, tid, 8, Kind::Spawn, 0, R_SPAWN | R_SPAWN_FS | R_SPAWN_NET | R_GRANT); // (grant: the console hands them on to the programs that start programs)
