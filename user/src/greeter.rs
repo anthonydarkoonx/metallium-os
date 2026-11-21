@@ -16,6 +16,30 @@ const SL_STORE: u64 = 30;
 /// so only there is the slot passed on: a call on an endpoint nobody receives on would wait for ever; 0 tells a greeter there is no service).
 const SL_SESSIONS: u64 = 29;
 
+/// Whose session has the screen: the session service's `ACTIVE` answer (id, the name in two words), set when the greeter returns after a login. The id is 0 with no session service.
+static ACTIVE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ACTIVE_NAME: [core::sync::atomic::AtomicU64; 2] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+/// The user whose session has the screen (id, name), if a session service ran and somebody logged in.
+pub fn active_session() -> Option<(u64, alloc::string::String)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let id = ACTIVE_ID.load(Relaxed);
+    if id == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&ACTIVE_NAME[0].load(Relaxed).to_le_bytes());
+    raw[8..].copy_from_slice(&ACTIVE_NAME[1].load(Relaxed).to_le_bytes());
+    let n = raw.iter().position(|&c| c == 0).unwrap_or(16);
+    Some((id, alloc::string::String::from_utf8_lossy(&raw[..n]).into_owned()))
+}
+
+/// Ask the session service whose session is the newest (`ACTIVE`, programs/src/bin/sessiond.rs): `(id, name words)`, or `None` if nobody is logged in.
+fn ask_active() -> Option<(u64, [u64; 2])> {
+    let (st, r) = call(SL_SESSIONS, [5, 0, 0]);
+    (st == 0 && r[0] & 0xFF == 0).then_some((r[0] >> 8, [r[1], r[2]]))
+}
+
 /// How the volume is (`state`, flags), or `None` if the store cannot be asked.
 pub fn volume_status() -> Option<(u64, u64)> {
     let (st, r) = call(SL_STORE, [LFS_STATUS, 0, 0]);
@@ -70,9 +94,25 @@ pub fn unlock_screen(fb: *mut u32) {
     #[cfg(greeter)]
     if locked || sessions != 0 {
         println!("[greeter] handing the screen to the greeter");
-        metallium_greeter_boot::metallium_greeter_run(SL_GPU, SL_KBD, SL_STORE, sessions, 2, fb as usize);
-        if volume_status().map_or(true, |(s, _)| s != state::LOCKED) {
-            return;
+        loop {
+            metallium_greeter_boot::metallium_greeter_run(SL_GPU, SL_KBD, SL_STORE, sessions, 2, fb as usize);
+            if volume_status().map_or(false, |(s, _)| s == state::LOCKED) {
+                break; // (the built-in prompt follows)
+            }
+            if sessions == 0 {
+                return;
+            }
+            // with a session service the screen is not handed on until somebody is logged in: the console must not be reachable without a session
+            if let Some((id, name)) = ask_active() {
+                use core::sync::atomic::Ordering::Relaxed;
+                ACTIVE_NAME[0].store(name[0], Relaxed);
+                ACTIVE_NAME[1].store(name[1], Relaxed);
+                ACTIVE_ID.store(id, Relaxed);
+                println!("[greeter] session {id} has the screen");
+                return;
+            }
+            println!("[greeter] the greeter returned and nobody is logged in: it runs again");
+            sleep(100);
         }
         println!("[greeter] the greeter returned with the volume still locked: the built-in prompt follows");
     }

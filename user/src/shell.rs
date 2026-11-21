@@ -185,6 +185,9 @@ impl Shell {
         self.con.reset();
         // (no machine summary on the first screen: `fetch` prints it when asked)
         self.update_status();
+        if let Some((id, name)) = crate::greeter::active_session() {
+            self.con.print(&format!("Signed in as {name} (session {id})\n"));
+        }
         self.prompt();
         self.con.flush();
         println!("[shell] ready: type on the keyboard");

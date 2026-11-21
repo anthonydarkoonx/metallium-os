@@ -124,6 +124,7 @@ if key:
     b.line(PASS1)
     check("the right passphrase logs in and the greeter hands the screen on", b.wait("[greeter] done", 180))
     check("the session service started the administrator's session", "root logged in" in b.log())
+    check("the screen task learns whose session has the screen (ACTIVE)", b.wait("has the screen", 30) and "nobody is logged in" not in b.log())
     check("the recovery key was not written anywhere but the test's console line", len(re.findall(re.escape(key.group(1)), b.log())) == 1)
 b.stop()
 disk = open(DISK, "rb").read()

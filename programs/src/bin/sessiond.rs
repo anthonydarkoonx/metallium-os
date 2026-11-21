@@ -23,12 +23,15 @@ use metallium_programs::*;
 //   SECRET w0 = 2 | total length << 8 | offset << 24, w1 w2 = 16 bytes of the secret at `offset`; the last chunk runs the action
 //   LOGOUT w0 = 3, w1 = session id
 //   STATUS w0 = 4 -> [number of users, number of sessions, 0]
+//   ACTIVE w0 = 5 -> [OK | session id << 8, w1 w2 = the user name (16 bytes, NUL padded)] of the newest live session, or [E_BAD, 0, 0] if there is none: the screen task asks it
+//          after the greeter returns, to learn whose session has the screen (until each session has its own screen, the newest login has it)
 // Actions: CREATE (secret: the passphrase; reply w0 = status | uid << 8, w1 w2 = the recovery key: show it once), LOGIN (the passphrase; reply w1 = the session id),
 // RESET (the 16 recovery-key bytes: opens the account's domain for a following SETPASS), SETPASS (the new passphrase: after a RESET, or by the user's own session `acting`).
 const OP_BEGIN: u64 = 1;
 const OP_SECRET: u64 = 2;
 const OP_LOGOUT: u64 = 3;
 const OP_STATUS: u64 = 4;
+const OP_ACTIVE: u64 = 5;
 const ACT_CREATE: u64 = 1;
 const ACT_LOGIN: u64 = 2;
 const ACT_RESET: u64 = 3;
@@ -70,6 +73,7 @@ struct Account {
 struct Session {
     id: u64,
     uid: u32,
+    name: String,
     child: Child,
 }
 
@@ -202,7 +206,7 @@ impl Svc {
         self.next_session += 1;
         let id = self.next_session;
         println!("[sessiond] {name} logged in: session {id} (task {})", child.id());
-        self.sessions.push(Session { id, uid, child });
+        self.sessions.push(Session { id, uid, name: name.clone(), child });
         [OK, id, 0]
     }
 
@@ -292,6 +296,14 @@ impl Svc {
             }
             OP_LOGOUT => self.logout(w[1]),
             OP_STATUS => [self.accounts.len() as u64, self.sessions.len() as u64, 0],
+            OP_ACTIVE => match self.sessions.last() {
+                Some(s) => {
+                    let mut raw = [0u8; 16];
+                    raw[..s.name.len().min(16)].copy_from_slice(&s.name.as_bytes()[..s.name.len().min(16)]);
+                    [OK | s.id << 8, u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap())]
+                }
+                None => [E_BAD, 0, 0],
+            },
             _ => [E_BAD, 0, 0],
         }
     }
