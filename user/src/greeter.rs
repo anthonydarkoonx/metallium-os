@@ -37,7 +37,7 @@ pub fn active_session() -> Option<(u64, alloc::string::String)> {
 /// Ask the session service whose session is the newest (`ACTIVE`, programs/src/bin/sessiond.rs): `(id, name words)`, or `None` if nobody is logged in.
 fn ask_active() -> Option<(u64, [u64; 2])> {
     let (st, r) = call(SL_SESSIONS, [5, 0, 0]);
-    (st == 0 && r[0] & 0xFF == 0).then_some((r[0] >> 8, [r[1], r[2]]))
+    (st == 0 && r[0] & 0xFF == 0).then_some(((r[0] >> 8) & 0xFFFF, [r[1], r[2]]))
 }
 
 /// How the volume is (`state`, flags), or `None` if the store cannot be asked.

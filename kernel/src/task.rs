@@ -345,15 +345,20 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                 install(t, tid, 9, Kind::Endpoint, ipc::EP_VFS, R_SEND);
                 install(t, tid, 10, Kind::Memory, obj::OBJ_SHM_VFS_CLIENT, R_MAP | R_WRITE);
                 install(t, tid, 11, Kind::MemCtl, 0, R_MEM_STATS | R_MEM_ALLOC | R_MEM_SWAP | R_MEM_PAGER | R_GRANT); // (grant: the memory-limit tests hand it to a program)
-                // conductor may start each benchmark client and read their results
-                for k in 0..ipc::BENCH_PAIRS {
-                    install(t, tid, 16 + k, Kind::Endpoint, ipc::EP_BENCH_GO + k as u16, R_SEND);
+                // conductor may start each benchmark client and read their results (not in the interactive boot, which runs no benchmarks: its slots stay free, for the session service to hand
+                // the conductor a session's manager endpoint)
+                if !crate::platform::interactive() {
+                    for k in 0..ipc::BENCH_PAIRS {
+                        install(t, tid, 16 + k, Kind::Endpoint, ipc::EP_BENCH_GO + k as u16, R_SEND);
+                    }
+                    install(t, tid, 20, Kind::Memory, obj::OBJ_SHM_BENCH, R_MAP);
                 }
-                install(t, tid, 20, Kind::Memory, obj::OBJ_SHM_BENCH, R_MAP);
             }
             if obj::blk_present() {
                 // scheduler tests: start and stop the CPU burners, and reserve real-time shares
-                install(t, tid, 24, Kind::Memory, obj::OBJ_SHM_SPIN, R_MAP | R_WRITE);
+                if !crate::platform::interactive() {
+                    install(t, tid, 24, Kind::Memory, obj::OBJ_SHM_SPIN, R_MAP | R_WRITE);
+                }
                 if matches!(crate::platform::only(), 13 | 14) || sessions_in_boot() {
                     // (the conductor starts the session service and hands it this endpoint: `make session-test`, `make greeter-test`, and the interactive boot. Not in the other
                     // runs: the conductor's capability table has no free slot to spare there, and the test that grants into its first free one must keep finding one)

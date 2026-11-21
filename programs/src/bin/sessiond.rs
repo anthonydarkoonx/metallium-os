@@ -11,6 +11,11 @@ use metallium_programs::*;
 
 // The session service (docs/MULTIUSER-PLAN.md). It keeps the accounts and starts a user's session confined to the user's home.
 //
+// With a numeric argument (the screen task's id: the interactive boot) a session is a *program manager* confined to the user's home (`progmgr`: the user's own installed
+// programs live in the home's `/programs`, whatever the user starts is confined to the same home), and slot 3 is the display endpoint (send, with the right to pass it on) that the
+// manager hands to programs that ask for a display. The manager's control endpoint is made here and a send copy given to the parent (the conductor), which passes it to the screen task: that is how the console reaches the
+// manager of the session that has the screen. Without the argument (`make session-test`) a session is `homeprobe`.
+//
 // Slot 0: its control endpoint (receive; whoever holds the send right is the greeter), slot 5: the endpoint factory, slot 6: the spawn capability (with file access),
 // slot 4: the data store's endpoint (the right to create, unlock and lock encryption domains). Accounts are lines `uid:name:role` in `/data/accounts`, which only this program
 // (unconfined) can see; there is no credential in them. A user's credential is the key slot of the user's encryption *domain* in the data store (domain = uid): logging in means
@@ -23,7 +28,7 @@ use metallium_programs::*;
 //   SECRET w0 = 2 | total length << 8 | offset << 24, w1 w2 = 16 bytes of the secret at `offset`; the last chunk runs the action
 //   LOGOUT w0 = 3, w1 = session id
 //   STATUS w0 = 4 -> [number of users, number of sessions, 0]
-//   ACTIVE w0 = 5 -> [OK | session id << 8, w1 w2 = the user name (16 bytes, NUL padded)] of the newest live session, or [E_BAD, 0, 0] if there is none: the screen task asks it
+//   ACTIVE w0 = 5 -> [OK | session id << 8 | the session's program manager task << 24 | the parent's slot for its control endpoint << 40 (both 0 in test mode; the slot is in the *parent's* table: the conductor passes it on), w1 w2 = the user name (16 bytes, NUL padded)] of the newest live session, or [E_BAD, 0, 0] if there is none: the screen task asks it
 //          after the greeter returns, to learn whose session has the screen (until each session has its own screen, the newest login has it)
 // Actions: CREATE (secret: the passphrase; reply w0 = status | uid << 8, w1 w2 = the recovery key: show it once), LOGIN (the passphrase; reply w1 = the session id),
 // RESET (the 16 recovery-key bytes: opens the account's domain for a following SETPASS), SETPASS (the new passphrase: after a RESET, or by the user's own session `acting`).
@@ -49,11 +54,16 @@ const E_BUSY: u64 = 8; // LOGIN: that user already has a session
 /// Files and directories a home may hold (the account holder's own quota; programs under it have theirs, never more).
 const HOME_QUOTA: u64 = 64;
 
+const R_GRANT: u16 = 4;
 const R_SPAWN: u16 = 1 << 12;
 const R_SPAWN_FS: u16 = 1 << 13;
 const R_EP_CREATE: u16 = 1 << 14;
 const FACTORY: u8 = 5;
 const SPAWN: u8 = 6;
+/// The display endpoint (send, and the right to pass it on): given only in the interactive boot.
+const DISPLAY: u8 = 3;
+/// Pages a session's program manager may hand down to the programs it starts.
+const SESSION_PAGES: u32 = 7000;
 const STORE: Endpoint = Endpoint(4);
 
 // the data store's domain calls (`proto::volume`)
@@ -74,6 +84,8 @@ struct Session {
     id: u64,
     uid: u32,
     name: String,
+    /// The manager's control endpoint (mine) and the parent's slot for it: only with a screen task.
+    ctl: Option<(Endpoint, u64)>,
     child: Child,
 }
 
@@ -196,17 +208,40 @@ impl Svc {
         }
         // the session: a program confined to the user's home (`/data` is `/data/home/<name>`), with a quota; the programs it starts are confined to the same directory
         let home = format!("/data/home/{name}");
-        let mut cmd = Command::new("homeprobe");
-        cmd.arg(&name).arg("probe").files(true).scope(&home).quota(HOME_QUOTA);
-        cmd.give(FACTORY, 5, R_EP_CREATE).give(SPAWN, 6, R_SPAWN | R_SPAWN_FS).budget_pages(1000);
-        let Ok(child) = cmd.spawn() else {
-            let _ = store_call(LFS_DOMAIN_LOCK, uid, 0, &[]);
-            return [E_FAILED, 0, 0];
+        let screen = env::arg();
+        let mut ctl = None;
+        let mut cmd = if screen != 0 { Command::new("progmgr") } else { Command::new("homeprobe") };
+        if screen != 0 {
+            // the manager: control endpoint as slot 0 (receive, and send with the right to pass it on), the display endpoint as 3, the factory and the spawn right (without the network) as 5 and 6
+            let Ok(ep) = Endpoint::create(FACTORY as u64) else {
+                let _ = store_call(LFS_DOMAIN_LOCK, uid, 0, &[]);
+                return [E_FAILED, 0, 0];
+            };
+            cmd.files(true).scope(&home).quota(HOME_QUOTA).budget_pages(SESSION_PAGES);
+            cmd.give(ep.0 as u8, 0, 0b111).give(DISPLAY, 3, 0b101);
+            cmd.give(FACTORY, 5, R_EP_CREATE | R_GRANT).give(SPAWN, 6, R_SPAWN | R_SPAWN_FS | R_GRANT);
+            ctl = Some(ep);
+        } else {
+            cmd.arg(&name).arg("probe").files(true).scope(&home).quota(HOME_QUOTA);
+            cmd.give(FACTORY, 5, R_EP_CREATE).give(SPAWN, 6, R_SPAWN | R_SPAWN_FS).budget_pages(1000);
+        }
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                if let Some(ep) = ctl {
+                    let _ = ep.destroy();
+                }
+                let _ = store_call(LFS_DOMAIN_LOCK, uid, 0, &[]);
+                return [E_FAILED, 0, 0];
+            }
         };
+        // the console reaches the manager through a send copy of its control endpoint (with the right to pass it on to the programs it starts). A program may grant only to its own
+        // children and its parent, so the copy goes to the parent (the conductor), which passes it to the screen task: ACTIVE says which slot of the parent's it is
+        let ctl = ctl.and_then(|ep| ipc::grant(ep.0, env::parent(), 0b101).ok().map(|slot| (ep, slot)));
         self.next_session += 1;
         let id = self.next_session;
         println!("[sessiond] {name} logged in: session {id} (task {})", child.id());
-        self.sessions.push(Session { id, uid, name: name.clone(), child });
+        self.sessions.push(Session { id, uid, name: name.clone(), ctl, child });
         [OK, id, 0]
     }
 
@@ -249,6 +284,9 @@ impl Svc {
         let Some(i) = self.sessions.iter().position(|s| s.id == id) else { return [E_BAD, 0, 0] };
         let s = self.sessions.remove(i);
         let _ = s.child.kill();
+        if let Some((ep, _)) = s.ctl {
+            let _ = ep.destroy();
+        }
         let _ = fs::sync();
         let _ = store_call(LFS_DOMAIN_LOCK, s.uid, 0, &[]); // the user's files are sealed again
         println!("[sessiond] session {id} ended");
@@ -300,7 +338,8 @@ impl Svc {
                 Some(s) => {
                     let mut raw = [0u8; 16];
                     raw[..s.name.len().min(16)].copy_from_slice(&s.name.as_bytes()[..s.name.len().min(16)]);
-                    [OK | s.id << 8, u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap())]
+                    let (slot, mgr) = (s.ctl.as_ref().map_or(0, |c| c.1), if s.ctl.is_some() { s.child.id() as u64 } else { 0 });
+                    [OK | s.id << 8 | (mgr & 0xFFFF) << 24 | (slot & 0xFF) << 40, u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap())]
                 }
                 None => [E_BAD, 0, 0],
             },

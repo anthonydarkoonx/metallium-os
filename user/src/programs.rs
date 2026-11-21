@@ -436,6 +436,9 @@ fn pager_tests(v: &Vfs, pager: &[u8], victim: &[u8]) {
     wait(tp, false);
 }
 
+/// Pages the session service may hand down: a program manager per session (`sessiond`'s `SESSION_PAGES`) and the service's own.
+const SESSIOND_BUDGET: u32 = 24000;
+
 /// An interactive session: the conductor has no tests to run. It starts the program manager, hands the screen task (the shell) a
 /// capability to send to the manager's control endpoint, and then has nothing left to do.
 pub fn console_session() -> ! {
@@ -443,43 +446,76 @@ pub fn console_session() -> ! {
     let _ = mem_map(10, 0x8034_0000, true);
     let v = Vfs::new(9, 0x8034_0000);
     let progmgr = (0..20).find_map(|_| v.read_file("/system/bin/progmgr").ok().filter(|b| b.len() > 32).or_else(|| { sleep(20); None })).unwrap_or_default();
+    let sessiond = v.read_file("/system/bin/sessiond").unwrap_or_default();
     let (mut ctl_slot, mut disp_slot, mut mgr, mut power_slot) = (0i64, 0i64, 0i64, 0i64);
     // the screen task is the one task of role 13
     let desk = (0..64u64).find(|&t| { let r = sysinfo_at(3, t); r[0] as i64 == 0 && r[3] != 0 && r[5] == 13 });
+    // With a session service (the system image has one) there is no program manager of the machine: each login gets its own (`sessiond`, confined to the user's home), and the
+    // console reaches the manager of the session that has the screen. Without one, the old single manager.
+    let with_sessions = sessiond.len() > 32 && desk.is_some() && !progmgr.is_empty();
     if !progmgr.is_empty() {
-        let ctl = svc(EP_CREATE, FACTORY_SLOT, 0, 0, 0, 0)[0] as i64; // the manager's control endpoint
+        let ctl = if with_sessions { 0 } else { svc(EP_CREATE, FACTORY_SLOT, 0, 0, 0, 0)[0] as i64 }; // the manager's control endpoint
         let disp = svc(EP_CREATE, FACTORY_SLOT, 0, 0, 0, 0)[0] as i64; // the display endpoint the console serves and programs call
         // the manager: control endpoint (receive + send) as slot 0, the display endpoint (send, and the right to hand a send-only
         // copy to the programs that ask for a display) as slot 3, the endpoint factory and the spawn capability as 5 and 6 (with the right to
         // hand them on: a program with `permission = spawn` gets a narrowed copy of each, never with that right), file access, and a budget of
         // pages for the programs it starts
         let mut rq = Req::new().fs().heap(4096).budget(24000).give_masked(5, FACTORY_SLOT as u8, 0xFFFF).give_masked(6, SPAWN_SLOT as u8, 0xFFFF).give_masked(7, ADMIN_SLOT as u8, 0xFFFF & !0x800); // (the revoke authority: the manager hands it to the task manager)
-        if ctl >= 0 {
+        if ctl >= 0 && !with_sessions {
             rq = rq.give_masked(0, ctl as u8, 0b111); // (the right to give copies: shell clients get one)
         }
         if disp >= 0 {
             rq = rq.give_masked(3, disp as u8, 0b101);
         }
-        mgr = if ctl >= 0 { rq.go(&progmgr) } else { ctl };
+        if with_sessions {
+            // the session service (programs/src/bin/sessiond.rs): the greeter in the screen task logs users in through the conductor's static endpoint (slot 29); it gets the display
+            // endpoint to give to each session's manager, and the screen task's id (a login hands the console a way to reach that session's manager)
+            let rq = Req::new().fs().heap(4096).budget(SESSIOND_BUDGET).arg(desk.unwrap_or(0)).give_masked(0, 29, 0b111).give_masked(3, disp as u8, 0b101).give_masked(5, FACTORY_SLOT as u8, 0xFFFF).give_masked(6, SPAWN_SLOT as u8, 0xFFFF).give_masked(4, 7, 0xFFFF);
+            mgr = if disp >= 0 { rq.go(&sessiond) } else { disp };
+            println!("[client] interactive session: session service task {mgr} (a program manager per session)");
+        } else {
+            mgr = if ctl >= 0 { rq.go(&progmgr) } else { ctl };
+        }
         if mgr > 0 {
             if let Some(d) = desk {
-                ctl_slot = svc(5, ctl as u64, d, 0b101, 0, 0)[0] as i64; // CAP_GRANT: send, and the right to give a copy to the programs it starts
+                if !with_sessions {
+                    ctl_slot = svc(5, ctl as u64, d, 0b101, 0, 0)[0] as i64; // CAP_GRANT: send, and the right to give a copy to the programs it starts
+                }
                 if disp >= 0 {
                     disp_slot = svc(5, disp as u64, d, 0b011, 0, 0)[0] as i64; // the console receives on it (and may send)
                 }
                 power_slot = svc(5, ADMIN_SLOT, d, 0x800, 0, 0)[0] as i64; // the right to switch the machine off or restart it (`R_POWER`), and nothing else of the admin capability
             }
         }
-        println!("[client] interactive session: program manager task {mgr}, control endpoint in the console's slot {ctl_slot}, display endpoint in {disp_slot}");
+        println!("[client] interactive session: program manager task {}, control endpoint in the console's slot {ctl_slot}, display endpoint in {disp_slot}", if with_sessions { 0 } else { mgr });
         // (the programs that come with the console - dock, launcher, files, task manager - return with the new GUI)
     }
-    // the session service (programs/src/bin/sessiond.rs): the greeter in the screen task logs users in through the conductor's static endpoint (slot 29)
-    let sessiond = v.read_file("/system/bin/sessiond").unwrap_or_default();
-    if sessiond.len() > 32 {
-        let rq = Req::new().fs().heap(4096).budget(8000).give_masked(0, 29, 0b111).give_masked(5, FACTORY_SLOT as u8, 0xFFFF).give_masked(6, SPAWN_SLOT as u8, 0xFFFF).give_masked(4, 7, 0xFFFF);
-        println!("[client] interactive session: session service task {}", rq.go(&sessiond));
-    } else {
-        println!("[client] interactive session: no session service in the system image");
+    if !with_sessions {
+        if sessiond.len() > 32 {
+            // (no screen task to hand a manager to, or no manager in the image: the service still runs for the greeter)
+            let rq = Req::new().fs().heap(4096).budget(8000).give_masked(0, 29, 0b111).give_masked(5, FACTORY_SLOT as u8, 0xFFFF).give_masked(6, SPAWN_SLOT as u8, 0xFFFF).give_masked(4, 7, 0xFFFF);
+            println!("[client] interactive session: session service task {}", rq.go(&sessiond));
+        } else {
+            println!("[client] interactive session: no session service in the system image");
+        }
+    }
+    let mut mgr = if with_sessions { 0 } else { mgr };
+    if with_sessions {
+        // The console is not started until somebody has logged in (the greeter has the screen until then, and the conductor's call below would wait for the screen task anyway): the session
+        // service made that user's program manager and gave this task a send copy of its control endpoint (a program may grant only to its parent), which goes on to the screen task.
+        let session = loop {
+            let (st, r) = call(29, [5, 0, 0]); // ACTIVE
+            if st == 0 && r[0] & 0xFF == 0 {
+                break r[0];
+            }
+            sleep(100);
+        };
+        let (id, m, slot) = ((session >> 8) & 0xFFFF, (session >> 24) & 0xFFFF, (session >> 40) & 0xFF);
+        if let (Some(d), true) = (desk, m != 0 && slot != 0) {
+            ctl_slot = svc(5, slot, d, 0b101, 0, 0)[0] as i64; // CAP_GRANT: send, and the right to give a copy to the programs it starts
+            mgr = m as i64;
+        }
+        println!("[client] interactive session: session {id}'s program manager is task {mgr}, control endpoint in the console's slot {ctl_slot}");
     }
     let w2 = (disp_slot.max(0) as u64 & 0xFF) | (mgr.max(0) as u64) << 8 | (power_slot.max(0) as u64 & 0xFF) << 16;
     let (st, _) = call(23, [crate::info::INFO_CONSOLE, ctl_slot.max(0) as u64, w2]);

@@ -60,7 +60,7 @@ chaos: kernel disk
 	 echo "== CHAOS (seed $(CHAOS_SEED)): ALL PASS ==" || { echo "== CHAOS (seed $(CHAOS_SEED)): FAILED (qemu rc=$$rc), see build-chaos.log =="; exit 1; }
 
 
-.PHONY: bigram-test greeter-test session-test-encrypted session-test table-test greeter-lib qemu-test-encrypted volume-test elf-boot-test usb-test usb-test-many usb-test-hub usb-test-noncoherent scale scale-run desktop-programs desktop-lib clippy stack-guard aslr-replay print-qemu quick-programs programs fuzz quick-bench quick-sched qemu-test-noncoherent chaos all user kernel disk erofs-check map-check qemu-test-up inherit-ab provenance-check run run-window test host-test qemu-test clean
+.PHONY: bigram-test greeter-test greeter-test-manager session-test-encrypted session-test table-test greeter-lib qemu-test-encrypted volume-test elf-boot-test usb-test usb-test-many usb-test-hub usb-test-noncoherent scale scale-run desktop-programs desktop-lib clippy stack-guard aslr-replay print-qemu quick-programs programs fuzz quick-bench quick-sched qemu-test-noncoherent chaos all user kernel disk erofs-check map-check qemu-test-up inherit-ab provenance-check run run-window test host-test qemu-test clean
 
 all: kernel
 
@@ -592,6 +592,12 @@ greeter-test:
 	@test -n "$(GREETER)" || { echo "greeter-test needs GREETER=<the greeter repository>"; exit 1; }
 	@$(MAKE) --no-print-directory user kernel disk GREETER=$(GREETER) GREETER_FEATURES=log-key
 	@python3 tools/greeter-test.py '$(QEMU)'
+
+# ... and the interactive boot itself: a login starts the user's own program manager, and the console is given its control endpoint (no test mode; the conductor starts the service)
+greeter-test-manager:
+	@test -n "$(GREETER)" || { echo "greeter-test-manager needs GREETER=<the greeter repository>"; exit 1; }
+	@$(MAKE) --no-print-directory user kernel disk GREETER=$(GREETER) GREETER_FEATURES=log-key
+	@GREETER_MANAGER=1 python3 tools/greeter-test.py '$(QEMU)'
 
 # Big RAM with a hole (a stand-in for a board with two banks): 6 GiB with the 1 GiB from 3 GiB to 4 GiB not RAM. The kernel must count only real RAM, never map or hand out the hole, and run
 # programs whose pages lie above the first GiB and above 4 GiB; the swap and compaction tests of `make qemu-test` need memory pressure and so are not run here.

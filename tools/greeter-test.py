@@ -10,6 +10,7 @@ cmd = sys.argv[1]
 DISK = "build-greeter.img"
 SOCK = "build-greeter.sock"
 results = []
+MANAGER = os.environ.get("GREETER_MANAGER") == "1"
 
 
 def check(what, ok):
@@ -31,7 +32,8 @@ class Boot:
         self.logname = f"build-greeter-{tag}.log"
         c = re.sub(r"file=\S+?,format=raw", f"file={DISK},format=raw", cmd)
         c = c.replace("-nographic", f"-display none -serial file:{self.logname} -monitor none -qmp unix:{SOCK},server,nowait")
-        c += " -fw_cfg name=opt/metallium/only,string=14 -fw_cfg name=opt/metallium/interactive,string=1"
+        # (GREETER_MANAGER=1: the interactive boot itself, with a program manager per session; else the test mode where the conductor only starts the session service)
+        c += ("" if MANAGER else " -fw_cfg name=opt/metallium/only,string=14") + " -fw_cfg name=opt/metallium/interactive,string=1"
         if os.path.exists(SOCK):
             os.remove(SOCK)
         open(self.logname, "w").close()
@@ -125,6 +127,13 @@ if key:
     check("the right passphrase logs in and the greeter hands the screen on", b.wait("[greeter] done", 180))
     check("the session service started the administrator's session", "root logged in" in b.log())
     check("the screen task learns whose session has the screen (ACTIVE)", b.wait("has the screen", 30) and "nobody is logged in" not in b.log())
+    if MANAGER:
+        check("the session has its own program manager, and the console is given its control endpoint", b.wait("[progmgr] starting", 60) and b.wait("session 1's program manager is task", 60))
+        b.line("prog list")
+        time.sleep(3)
+        b.shot("5-console")
+        log = b.log()
+        check("the machine has no program manager of its own (the session service and the session's manager only)", log.count("[progmgr] starting") == 1 and "[progmgr] cannot set up" not in log)
     check("the recovery key was not written anywhere but the test's console line", len(re.findall(re.escape(key.group(1)), b.log())) == 1)
 b.stop()
 disk = open(DISK, "rb").read()
