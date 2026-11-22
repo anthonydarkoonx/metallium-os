@@ -115,9 +115,7 @@ check("making the administrator shows a recovery key", ok)
 key = re.search(r"recovery key ([0-9A-Z-]{32})", b.log())
 b.shot("2-key")
 if key:
-    last = key.group(1).split("-")[-1].lower()
-    b.line("xxxx")  # a wrong last group is refused
-    b.line(last)
+    b.key("ret")  # (the key is shown once; Enter goes on)
     time.sleep(2)
     b.shot("3-login")
     b.line("not-the-passphrase")
