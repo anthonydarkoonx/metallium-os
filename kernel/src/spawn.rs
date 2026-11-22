@@ -320,7 +320,7 @@ static NO_FIXED_MAPS: crate::table::Table<core::sync::atomic::AtomicBool> = crat
 
 /// The boot-time services (not the test programs) may not name addresses for `MEM_MAP` either.
 pub fn restrict_boot_task(tid: usize, role: u8) {
-    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20) {
+    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20 | 22) {
         NO_FIXED_MAPS[tid].store(true, Ordering::SeqCst);
     } else {
         NO_FIXED_MAPS[tid].store(false, Ordering::SeqCst);
@@ -409,6 +409,19 @@ pub fn boot_net_page(tid: usize) -> Option<u8> {
         NET_PAGE[p].store(k, Ordering::SeqCst);
     }
     NET_GEN[p].fetch_add(1, Ordering::SeqCst);
+    Some(k)
+}
+
+/// A boot-time task that is a client of the file system with a page of the session pool (the consoles of the ttys): claimed once, the generation changes each time it is built.
+/// The VFS finds it by the page the kernel reports for the task (SYSINFO page 5), as for any program with file access.
+pub fn boot_fs_page(tid: usize) -> Option<u8> {
+    let p = task::aspace(tid);
+    let mut k = FS_PAGE[p].load(Ordering::SeqCst);
+    if k == NO_FS {
+        k = claim_fs_page()?;
+        FS_PAGE[p].store(k, Ordering::SeqCst);
+    }
+    FS_GEN[p].fetch_add(1, Ordering::SeqCst);
     Some(k)
 }
 

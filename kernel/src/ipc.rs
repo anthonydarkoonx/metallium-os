@@ -17,8 +17,8 @@ use crate::task::{self, frame, State};
 use core::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::cap::NodeId;
 
-/// Endpoints 0..21 are the boot-time services'; the rest are created at run time (`EP_CREATE`, see below).
-pub const EP_FIRST_DYNAMIC: u16 = 22;
+/// Endpoints 0..24 are the boot-time services'; the rest are created at run time (`EP_CREATE`, see below).
+pub const EP_FIRST_DYNAMIC: u16 = 25;
 /// The most endpoints a boot can have (lock ranks are reserved for this many); `nep()` is how many it does have.
 pub const MAX_EPS: usize = 4400;
 static NEP: AtomicUsize = AtomicUsize::new(0);
@@ -66,6 +66,8 @@ pub const EP_MONKEY: u16 = 19;
 pub const EP_NET: u16 = 20;
 /// The audio service (a platform with an audio device runs it as role 20; others have none).
 pub const EP_AUDIO: u16 = 21;
+/// The consoles of ttys 1..3 (role 22), each told by the conductor when a session has its tty: 22, 23, 24.
+pub const EP_TTY: u16 = 22;
 pub const BENCH_PAIRS: usize = 4;
 const QLEN: usize = 8;
 

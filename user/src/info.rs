@@ -108,6 +108,19 @@ pub fn info_task() -> ! {
     }
 }
 
+/// The console of a tty behind the first (role 22): it waits for the conductor to say a session has its tty (`INFO_CONSOLE`, as for the screen task), then runs the shell on
+/// its own buffer. Its presents go to that buffer whatever they name (`GPU_BIND`), and it gets only its tty's input (`INPUT_ASSIGN`).
+pub fn tty_console_task() -> ! {
+    loop {
+        let m = recv(0);
+        if m.w[0] == INFO_CONSOLE {
+            reply([0, 0, 0]);
+            crate::screen::run(gather(), m.w[1], m.w[2])
+        }
+        reply([1, 0, 0]);
+    }
+}
+
 /// The conductor tells the screen task to take over the display once the tests are done.
 pub fn conductor_start() {
     let (st, r) = call(23, [INFO_START, 0, 0]);

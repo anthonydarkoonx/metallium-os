@@ -1060,7 +1060,8 @@ fn client_page(sender: u64, gens: &mut [u64]) -> Option<(usize, bool, usize)> {
         0 => Some((va(VA_CLIENT0), false, 0)),
         8 => Some((va(VA_CLIENT8), false, 8)),
         s if s == SHELL_TASK.load(core::sync::atomic::Ordering::Relaxed) => Some((va(VA_SHELL), false, s as usize)),
-        s if s >= 27 && (s as usize) < gens.len() => {
+        // (a boot task below 27 that has a session page, the consoles of ttys 1..3, is served like a program: the kernel says which page is its own)
+        s if s != 0 && (s as usize) < gens.len() => {
             let r = sysinfo_at(5, s);
             // (the threads of a program share its session, and so its descriptors: `r[3]` is the program)
             let (page, gen, owner) = (r[1] as usize, r[2], r[3] as usize);

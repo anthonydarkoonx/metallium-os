@@ -320,7 +320,7 @@ fn install(t: &mut Task, tid: usize, slot: usize, kind: Kind, obj: u16, rights: 
 }
 
 /// The interactive boot (`make run-window`, no test mode) starts the session service: its endpoint is installed in the conductor and the screen task.
-fn sessions_in_boot() -> bool {
+pub fn sessions_in_boot() -> bool {
     crate::platform::interactive() && crate::platform::only() == 0
 }
 
@@ -351,6 +351,9 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                     // (`make tty-test`: the conductor draws into two ttys' buffers and has the display driver switch between them)
                     install(t, tid, 16, Kind::Memory, obj::OBJ_GPU_FB1, R_MAP | R_WRITE);
                     install(t, tid, 17, Kind::Memory, obj::OBJ_GPU_FB1 + 1, R_MAP | R_WRITE);
+                    for k in 0..obj::TTY_BUFFERS - 1 {
+                        install(t, tid, 18 + k, Kind::Endpoint, ipc::EP_TTY + k as u16, R_SEND); // (the consoles of ttys 1..3: told to start)
+                    }
                 } else if !crate::platform::interactive() {
                     for k in 0..ipc::BENCH_PAIRS {
                         install(t, tid, 16 + k, Kind::Endpoint, ipc::EP_BENCH_GO + k as u16, R_SEND);
@@ -462,6 +465,21 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                     install(t, tid, 13, Kind::Memory, obj::OBJ_SHM_NET_PROG0 + k as u16, R_MAP | R_WRITE);
                 }
             }
+        }
+        22 => {
+            // the console of tty `k` (1..3): what the screen task has, but its own buffer, endpoint and file page. It waits for the conductor to say a session has its tty
+            let k = (0..tid).filter(|&i| INFO.read(i).role == 22).count();
+            install(t, tid, 0, Kind::Endpoint, ipc::EP_TTY + k as u16, R_RECV);
+            install(t, tid, 1, Kind::Endpoint, ipc::EP_GPU, R_SEND);
+            install(t, tid, 2, Kind::Memory, obj::OBJ_GPU_FB1 + k as u16, R_MAP | R_WRITE);
+            install(t, tid, 3, Kind::Endpoint, ipc::EP_BLK, R_SEND);
+            install(t, tid, 4, Kind::Endpoint, ipc::EP_KBD, R_SEND);
+            install(t, tid, 5, Kind::Endpoint, ipc::EP_VFS, R_SEND);
+            if let Some(p) = crate::spawn::boot_fs_page(tid) {
+                install(t, tid, 6, Kind::Memory, obj::OBJ_SHM_VFS_PROG0 + p as u16, R_MAP | R_WRITE);
+            }
+            install(t, tid, 8, Kind::Spawn, 0, R_SPAWN | R_SPAWN_FS | R_GRANT);
+            install(t, tid, 9, Kind::Factory, 0, R_EP_CREATE | R_GRANT);
         }
         19 => {
             // the network service: its endpoint, the packet buffers and ring it shares with the driver (no physical
@@ -612,7 +630,7 @@ pub fn spawn(role: u8, name: &'static str, class: Class, restartable: bool) -> u
         heap_quota: match role {
             0 => CONDUCTOR_HEAP_PAGES,
             // the console holds its clients' window surfaces (shared memory it creates, charged to it) as well as its own heap
-            13 => CONSOLE_HEAP_PAGES,
+            13 | 22 => CONSOLE_HEAP_PAGES,
             6 | 7 => STORAGE_HEAP_PAGES,
             _ => MAX_HEAP_PAGES,
         },

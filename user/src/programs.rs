@@ -1633,6 +1633,17 @@ pub fn tty_test() {
     println!("[tty] input saw: \"{chars}\", {fkeys} function key event(s), {fronts} front event(s)");
     println!("[tty] TEST only the key typed while tty 2 was in front arrived, no function key reached it, and it was told once that it came to the front: {}", verdict(chars == "y" && fkeys == 0 && fronts == 1));
     println!("[tty] done");
+    // the consoles of ttys 1..3 (role 22): the conductor plays the session service and gives tty 1's console its input and its buffer, then tells it to start; tools/tty-test.py
+    // switches to tty 1 (Ctrl+Alt+F2) and checks that the console is on the screen, and that a key typed there reaches it and not the console of tty 2 (which is never started)
+    let consoles: alloc::vec::Vec<u64> = (0..64u64).filter(|&t| { let r = sysinfo_at(3, t); r[0] as i64 == 0 && r[3] != 0 && r[5] == 22 }).collect();
+    println!("[tty] TEST the boot has one console task for each of the ttys 1..3 ({}): {}", consoles.len(), verdict(consoles.len() == 3));
+    if let Some(&c) = consoles.first() {
+        let (a, b) = (call(14, [INPUT_ASSIGN, c, 1]), call(21, [GPU_BIND, c, 1]));
+        println!("[tty] TEST the console of tty 1 is given its input and bound to its buffer (replies {} {}): {}", a.1[0], b.1[0], verdict(a.0 == 0 && a.1[0] == 0 && b.0 == 0 && b.1[0] == 0));
+        let (st, r) = call(18, [crate::info::INFO_CONSOLE, 0, 0]);
+        println!("[tty] TEST the console of tty 1 starts (status {st}, reply {}): {}", r[0], verdict(st == 0 && r[0] == 0));
+        println!("[tty] console: started");
+    }
     loop {
         sleep(1000);
     }

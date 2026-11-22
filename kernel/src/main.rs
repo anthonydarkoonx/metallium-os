@@ -242,6 +242,12 @@ extern "C" fn kmain(dtb: usize) -> ! {
     // (after everything else: the tasks above keep the ids their clients know them by)
     devices::spawn_tasks(devices::Phase::Network);
     platform::spawn_extra_tasks();
+    // the consoles of ttys 1..3 (the tty buffers exist only where sessions run): last, so every other task keeps the id its clients know it by
+    if obj::gpu_present() && obj::blk_present() && (task::sessions_in_boot() || platform::only() == 15) {
+        for _ in 1..obj::TTY_BUFFERS {
+            task::spawn(22, "tty-console", Class::Interactive, false);
+        }
+    }
 
     kprintln!("[kernel] capability nodes in use: {} of {}", cap::nodes_in_use(), cap::NODES);
     kprintln!("[kernel] entering userspace");

@@ -510,6 +510,7 @@ fn ep_name(e: u16) -> &'static str {
         ipc::EP_KBD => "input driver",
         ipc::EP_MONKEY => "fault injector",
         ipc::EP_NET => "network driver",
+        ipc::EP_TTY..=24 => "tty console",
         _ => "endpoint",
     }
 }
