@@ -353,6 +353,40 @@ pub fn recv(me: usize, e: u16, block: bool) -> Recv {
     Recv::Blocked
 }
 
+/// Park the call `server` is serving (a synchronous one): the caller stays blocked, the server is free to serve others, and gets back the caller's id as a token for `reply_to`. A server
+/// that parks callers holds them in a table of its own; one that dies leaves them to the usual clean-up of callers of a dead server.
+pub fn defer(server: usize) -> Option<u64> {
+    let mut t = task::lock(server);
+    match t.reply_to {
+        Some((c, 0)) => {
+            t.reply_to = None;
+            drop(t);
+            sched::clear_inherit(server);
+            Some(c as u64)
+        }
+        _ => None,
+    }
+}
+
+/// Answer a caller parked by `defer`: false if it is gone, was not parked by `server`, or has moved on.
+pub fn reply_to(server: usize, token: u64, w: [u64; 3]) -> bool {
+    if token >= task::limit() as u64 {
+        return false;
+    }
+    let c = token as usize;
+    let mut tc = task::lock(c);
+    if tc.callee != Some(server as u16) || sched::state(c) != State::CallWait {
+        return false;
+    }
+    tc.callee = None;
+    let mut f = frame(c);
+    f.x[0] = 0;
+    f.x[1] = w[0];
+    f.x[2] = w[1];
+    f.x[3] = w[2];
+    sched::wake_if(c, State::CallWait)
+}
+
 /// Reply from `server` to the caller it is currently serving.
 pub fn reply(server: usize, w: [u64; 3]) -> bool {
     let link = task::lock(server).reply_to.take();

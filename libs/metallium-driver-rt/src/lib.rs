@@ -41,6 +41,8 @@ pub const CLOCK: u64 = 34;
 pub const GETRANDOM: u64 = 43;
 /// The machine's own secret (only the data store server may ask): 32 bytes in x1..x4.
 pub const DEVICE_SECRET: u64 = 46;
+pub const IPC_DEFER: u64 = 47;
+pub const IPC_REPLY_TO: u64 = 48;
 /// Sleep for a number of microseconds, not rounded up to the scheduler tick.
 pub const SLEEP_US: u64 = 44;
 /// Set the wall clock to a Unix time in nanoseconds; only netd may.
@@ -196,8 +198,22 @@ pub fn recv(slot: u64) -> Msg {
     let r = svc(IPC_RECV, slot, 0, 0, 0, 0);
     Msg { sender: r[1], w: [r[2], r[3], r[4]], is_call: r[5] != 0 }
 }
+/// Like `recv`, but returns `None` at once if nothing is queued (`IPC_RECV` with its second argument set).
+pub fn try_recv(slot: u64) -> Option<Msg> {
+    let r = svc(IPC_RECV, slot, 1, 0, 0, 0);
+    (r[0] as i64 == 0).then(|| Msg { sender: r[1], w: [r[2], r[3], r[4]], is_call: r[5] != 0 })
+}
 pub fn reply(w: [u64; 3]) -> i64 {
     svc(IPC_REPLY, w[0], w[1], w[2], 0, 0)[0] as i64
+}
+/// Park the call being served (see `IPC_DEFER`): the caller waits, this task serves others; the token goes to `reply_to` later. `None` if there is no call to park.
+pub fn defer() -> Option<u64> {
+    let r = svc(IPC_DEFER, 0, 0, 0, 0, 0)[0] as i64;
+    (r >= 0).then_some(r as u64)
+}
+/// Answer a parked caller; false if it is gone.
+pub fn reply_to(token: u64, w: [u64; 3]) -> bool {
+    svc(IPC_REPLY_TO, token, w[0], w[1], w[2], 0)[0] as i64 == 0
 }
 /// Like `irq_wait`, but gives up after `ticks` (returns E_TIMEDOUT): the driver's watchdog on a silent device.
 pub fn irq_wait_timeout(slot: u64, ticks: u64) -> i64 {

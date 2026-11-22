@@ -117,9 +117,44 @@ struct Kbd {
     swallow: u16,
     /// Which tty each task's input belongs to (`INPUT_ASSIGN`); a task that is not here is on tty 0.
     assigned: [(u16, u8); 8],
+    /// Callers of a tty that is not in front, parked (`defer`) instead of answered with nothing at once: (task, tty, tick to answer at the latest). They are answered when their tty
+    /// comes to the front, or when their time is up (so a session behind can go on with its own work: it polls again, gets nothing, and is parked again). A time is only noticed
+    /// when the driver wakes up for something else: the tty in front polls or waits all the time.
+    parked: [(u64, u8, u64); 16],
+    nparked: usize,
 }
 
 impl Kbd {
+    /// Answer (with nothing) the parked callers whose tty is in front or whose time is up.
+    fn release(&mut self) -> bool {
+        let now = ticks();
+        let mut any = false;
+        let mut i = 0;
+        while i < self.nparked {
+            let (task, tty, due) = self.parked[i];
+            if tty as usize == self.active || now >= due {
+                let _ = reply_to(task, [0, 0, 0]); // (false: it died or moved on)
+                self.nparked -= 1;
+                self.parked[i] = self.parked[self.nparked];
+                any = true;
+            } else {
+                i += 1;
+            }
+        }
+        any
+    }
+
+    /// Hold the call being served until `ticks` pass or its tty comes to the front; false (nothing parked) if the table is full.
+    fn park(&mut self, task: u64, wait_ticks: u64) -> bool {
+        if self.nparked == self.parked.len() {
+            return false;
+        }
+        let Some(token) = defer() else { return false };
+        self.parked[self.nparked] = (token, self.tty_of(task) as u8, ticks() + wait_ticks.max(1));
+        self.nparked += 1;
+        true
+    }
+
     fn tty_of(&self, task: u64) -> usize {
         self.assigned.iter().find(|a| a.0 as u64 == task && a.0 != u16::MAX).map_or(0, |a| a.1 as usize)
     }
@@ -277,7 +312,7 @@ impl Kbd {
         loop {
             self.pump();
             let now = ticks();
-            if self.ev_len > 0 || now >= end {
+            if self.ev_len > 0 || now >= end || self.switch.is_some() || self.parked[..self.nparked].iter().any(|p| now >= p.2) {
                 return;
             }
             match &mut self.usb {
@@ -380,6 +415,8 @@ fn kbd_init() -> Result<Kbd, &'static str> {
         switch: None,
         swallow: 0,
         assigned: [(u16::MAX, 0); 8],
+        parked: [(0, 0, 0); 16],
+        nparked: 0,
     })
 }
 
@@ -400,7 +437,18 @@ pub fn kbd_driver() -> ! {
         println!("[kbd] usb ready: {} keyboard(s), {} pointer(s), polled", u.keyboards, u.pointers);
     }
     loop {
-        let m = recv(0);
+        // (with callers parked the driver looks for a message every tick instead of sleeping in `recv`, so a parked caller is answered when its time is up even if nobody else calls)
+        let m = loop {
+            if k.nparked == 0 {
+                break recv(0);
+            }
+            if let Some(m) = try_recv(0) {
+                break m;
+            }
+            k.pump();
+            k.release();
+            sleep(1);
+        };
         k.pump();
         if let Some(t) = k.switch.take() {
             // the display driver does the switch (it answers 1 for a tty it has no buffer for: nothing changes then)
@@ -410,6 +458,7 @@ pub fn kbd_driver() -> ! {
                 println!("[kbd] tty {t} is in front");
             }
         }
+        k.release(); // (callers of a tty that just came to the front, or that have waited long enough)
         // a task gets input only while its tty is in front; the others see nothing (and go on asking: a desktop of a tty behind has nothing to do anyway)
         let mine = k.tty_of(m.sender) == k.active;
         match m.w[0] {
@@ -420,7 +469,15 @@ pub fn kbd_driver() -> ! {
                 // (a switch during the wait: whatever arrived is for the tty that is in front now)
                 if k.tty_of(m.sender) == k.active { reply(k.take_events()) } else { reply([0, 0, 0]) }
             }
-            KBD_POLL | INPUT_POLL | INPUT_WAIT => reply([0, 0, 0]),
+            // a task of a tty behind: nothing for it. A call is parked (a desktop's wait for as long as it asked; a poll for a quarter of a second) instead of being answered at once,
+            // so a hidden desktop does not spin and a hidden console does not poll every few milliseconds
+            KBD_POLL | INPUT_POLL | INPUT_WAIT => {
+                let ticks = if m.w[0] == INPUT_WAIT { m.w[1].min(1000).div_ceil(10) } else { 25 };
+                if !(m.is_call && k.park(m.sender, ticks)) {
+                    reply([0, 0, 0]);
+                }
+                0
+            }
             INPUT_ASSIGN => {
                 let (task, tty) = (m.w[1], m.w[2]);
                 let slot = k.assigned.iter().position(|a| a.0 as u64 == task || a.0 == u16::MAX);

@@ -93,6 +93,10 @@ pub const SETTIME: u64 = 45;
 /// DEVICE_SECRET() -> 0 and 32 bytes in x1..x4: a secret that belongs to this machine (a chip's unique value; QEMU: the fw_cfg file `opt/metallium/device-secret`), the
 /// one thing that opens an encrypted data volume without anyone typing a passphrase. Only the data store server (role 6) may ask (`E_PERM`); `E_NOSYS` if the machine has none.
 pub const DEVICE_SECRET: u64 = 46;
+/// IPC_DEFER() -> a token (the caller's id): park the synchronous call being served, so the server can serve others; `E_NOREPLY` if there is none (or it came through a ring).
+pub const IPC_DEFER: u64 = 47;
+/// IPC_REPLY_TO(token, w0, w1, w2): answer a caller parked by `IPC_DEFER`; `E_NOREPLY` if it is gone or was not parked by this task.
+pub const IPC_REPLY_TO: u64 = 48;
 pub const SC_RT_SET: u64 = 1;
 pub const SC_RT_WAIT: u64 = 2;
 pub const SC_RT_CLEAR: u64 = 3;
@@ -158,6 +162,8 @@ fn run(cur: usize) -> (u64, Out) {
         IPC_SEND | IPC_CALL => ipc_send(cur, a1, [a2, a3, a4], id == IPC_CALL),
         IPC_RECV => ipc_recv(cur, a1, a2 != 0), // a2 != 0: do not wait (E_AGAIN, -10, if nothing is queued)
         IPC_REPLY => Out::Ret(if ipc::reply(cur, [a1, a2, a3]) { 0 } else { E_NOREPLY }),
+        IPC_DEFER => Out::Ret(ipc::defer(cur).map_or(E_NOREPLY, |t| t as i64)),
+        IPC_REPLY_TO => Out::Ret(if ipc::reply_to(cur, a1, [a2, a3, a4]) { 0 } else { E_NOREPLY }),
         MEM_MAP => mem_map(cur, a1, a2 as usize, a3 != 0),
         CAP_GRANT => cap_grant(cur, a1, a2, a3 as Rights, a4),
         CAP_REVOKE => cap_revoke(cur, a1, a2 & 1 != 0),

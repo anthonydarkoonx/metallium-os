@@ -1674,9 +1674,16 @@ pub fn tty_test() {
     use crate::proto::input::*;
     let assign = call(14, [INPUT_ASSIGN, 0, 2]);
     println!("[tty] TEST the conductor is given tty 2's input (reply {}): {}", assign.1[0], verdict(assign.0 == 0 && assign.1[0] == 0));
+    // tty 2 is not in front: a wait for input is held for as long as it asked (300 ms) instead of being answered with nothing at once (a hidden desktop would spin), and a caller whose
+    // tty comes to the front is answered then (the harness's Ctrl+Alt+F3 below ends the polling loop's waits early the same way)
+    let (t0, w) = (ticks(), call(14, [INPUT_WAIT, 300, 0]));
+    let held = ticks() - t0;
+    println!("[tty] TEST a hidden task's wait for input is held for its time (status {}, {} events, {} ms): {}", w.0, w.1[0] & 0xFF, held * 10, verdict(w.0 == 0 && w.1[0] & 0xFF == 0 && (25..=60).contains(&held)));
     println!("[tty] input: start");
     let (mut chars, mut fkeys, mut fronts) = (alloc::string::String::new(), 0, 0);
-    for _ in 0..1500 {
+    // (15 s: a poll from a tty that is behind is held for up to a quarter of a second now, so the loop counts time, not polls)
+    let start = ticks();
+    while ticks() - start < 1500 {
         let (st, r) = call(14, [KBD_POLL, 0, 0]);
         if st == 0 {
             for i in 0..(r[0] & 0xFF).min(16) {
