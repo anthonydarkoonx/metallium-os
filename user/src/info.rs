@@ -81,6 +81,8 @@ pub fn info_task() -> ! {
         // (`make tty-test`: a task that is neither the input driver nor the conductor may not switch the screen)
         let r = call(1, [crate::proto::gpu::GPU_SCANOUT, 1, 0]);
         println!("[tty] TEST the screen task may not switch ttys (reply {}): {}", r.1[0], verdict(r.1[0] == 2));
+        let b = call(1, [crate::proto::gpu::GPU_BIND, 0xFF, 1]);
+        println!("[tty] TEST the screen task may not bind a task to a tty (reply {}): {}", b.1[0], verdict(b.1[0] == 1));
     }
     println!("[shell] waiting for the display tests to finish");
     loop {

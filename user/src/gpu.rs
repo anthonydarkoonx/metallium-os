@@ -228,9 +228,14 @@ pub fn gpu_driver() -> ! {
             exit(1)
         }
     };
+    // which buffer a task is bound to (`GPU_BIND`): its presents go to that buffer whatever they name; a task that is not here may name any
+    let mut bound = [(u16::MAX, 0u8); 8];
     loop {
         let m = recv(0);
-        let (op, buffer) = (m.w[0] & 0xFF, (m.w[0] >> BUFFER_SHIFT) as usize & 0xFF);
+        let (op, mut buffer) = (m.w[0] & 0xFF, (m.w[0] >> BUFFER_SHIFT) as usize & 0xFF);
+        if let Some(b) = bound.iter().find(|b| b.0 as u64 == m.sender) {
+            buffer = b.1 as usize;
+        }
         // a present names its tty's buffer (0 when it says nothing); one that is not on the screen is copied to the host, not shown
         let res = buffer as u32 + 1;
         let shown = buffer == g.active;
@@ -292,6 +297,24 @@ pub fn gpu_driver() -> ! {
             }
             GPU_ACTIVE => {
                 reply([g.active as u64, g.buffers as u64, 0]);
+            }
+            GPU_BIND => {
+                // only the conductor binds (it starts a session's console and knows which tty it is for); w2 = BIND_NONE frees the task's entry
+                let (task, b) = (m.w[1], m.w[2]);
+                let slot = bound.iter().position(|e| e.0 as u64 == task).or_else(|| bound.iter().position(|e| e.0 == u16::MAX));
+                match slot {
+                    Some(i) if m.sender == 0 && task < u16::MAX as u64 && b == BIND_NONE => {
+                        bound[i] = (u16::MAX, 0);
+                        reply([0, 0, 0]);
+                    }
+                    Some(i) if m.sender == 0 && task < u16::MAX as u64 && (b as usize) < g.buffers => {
+                        bound[i] = (task as u16, b as u8);
+                        reply([0, 0, 0]);
+                    }
+                    _ => {
+                        reply([1, 0, 0]);
+                    }
+                }
             }
             GPU_STALL => {
                 if m.sender != 0 {

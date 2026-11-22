@@ -1588,6 +1588,13 @@ pub fn tty_test() {
     println!("[tty] TEST drawing into the buffers of ttys that are not in front is accepted (status {} {}): {}", s1.1[0], s2.1[0], verdict(s1.0 == 0 && s1.1[0] == 0 && s2.0 == 0 && s2.1[0] == 0));
     let bad = call(21, [GPU_FLUSH2 | 4 << BUFFER_SHIFT, full, 0]);
     println!("[tty] TEST a buffer that does not exist is refused (reply {}): {}", bad.1[0], verdict(bad.1[0] == 1));
+    // a task bound to a buffer draws only there: the conductor binds itself to tty 2, and a present that names a buffer that does not exist (9) goes to tty 2's instead of being refused
+    let (bad_bind, bind) = (call(21, [GPU_BIND, 0, 4]), call(21, [GPU_BIND, 0, 2]));
+    let forced = call(21, [GPU_FLUSH2 | 9 << BUFFER_SHIFT, full, 0]);
+    let unbind = call(21, [GPU_BIND, 0, BIND_NONE]);
+    let after = call(21, [GPU_FLUSH2 | 9 << BUFFER_SHIFT, full, 0]);
+    println!("[tty] TEST a task bound to a tty's buffer draws only there, a buffer that does not exist cannot be bound, and an unbound task is refused again (replies {} {} {} {} {}): {}", bad_bind.1[0], bind.1[0], forced.1[0], unbind.1[0], after.1[0],
+        verdict(bad_bind.1[0] == 1 && bind.1[0] == 0 && forced.1[0] == 0 && unbind.1[0] == 0 && after.1[0] == 1));
     println!("[tty] hidden: ttys 1 and 2 are drawn, tty 0 is in front");
     sleep(300);
     for t in [1u64, 2, 0] {

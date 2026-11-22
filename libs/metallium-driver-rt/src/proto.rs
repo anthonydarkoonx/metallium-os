@@ -38,6 +38,11 @@ pub mod gpu {
     pub const GPU_SCANOUT: u64 = 35;
     /// Which buffer is on the screen: reply [buffer, number of buffers, 0]. `GPU_INFO`'s third word is the number of buffers too.
     pub const GPU_ACTIVE: u64 = 36;
+    /// Bind a task to a tty's buffer: w1 = the task, w2 = the buffer (or `BIND_NONE` to free the entry). Only the conductor may. Every present from a bound task goes to its buffer whatever
+    /// the call names, so a session's console cannot draw on another tty. Replies 0, or 1 for a refused caller, a buffer that does not exist, or no room (8 tasks). The entry outlives
+    /// the task (ids are reused): whoever binds frees it when the task is gone.
+    pub const GPU_BIND: u64 = 37;
+    pub const BIND_NONE: u64 = 0xFF;
 }
 
 /// The data volume's lock (the data store server, role 6; the greeter and the other system tasks that hold its endpoint send these). Nothing else about the
