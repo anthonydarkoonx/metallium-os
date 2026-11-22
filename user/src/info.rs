@@ -13,6 +13,8 @@ pub const INFO_START: u64 = 40;
 /// An interactive session (`make run-window`): the screen task becomes the console. w1: my slot for the program manager's control
 /// endpoint (0: none), w2: my slot for the display endpoint | the manager's task id << 8.
 pub const INFO_CONSOLE: u64 = 42;
+/// The conductor tells the console of a tty behind the first to ask for a login on its own buffer (once the first user is logged in); the console says yes at once and runs the greeter.
+pub const INFO_GREETER: u64 = 43;
 /// Draw the colour-bar test card and present it.
 pub const INFO_CARD: u64 = 41;
 
@@ -113,11 +115,24 @@ pub fn info_task() -> ! {
 pub fn tty_console_task() -> ! {
     loop {
         let m = recv(0);
-        if m.w[0] == INFO_CONSOLE {
-            reply([0, 0, 0]);
-            crate::screen::run(gather(), m.w[1], m.w[2])
+        match m.w[0] {
+            INFO_GREETER => {
+                reply([0, 0, 0]);
+                if mem_map(2, FB_VA, true) != 0 {
+                    println!("[tty] cannot map the buffer");
+                    exit(1)
+                }
+                // returns when somebody has logged in; whose session it is, the conductor finds out from the session service (it asks which session this task logged in)
+                crate::greeter::unlock_screen(va(FB_VA) as *mut u32);
+            }
+            INFO_CONSOLE => {
+                reply([0, 0, 0]);
+                crate::screen::run(gather(), m.w[1], m.w[2])
+            }
+            _ => {
+                reply([1, 0, 0]);
+            }
         }
-        reply([1, 0, 0]);
     }
 }
 

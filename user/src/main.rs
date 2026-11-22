@@ -88,7 +88,7 @@ fn client() -> ! {
         chaos::run(); // chaos-test mode (make chaos): a different job for the conductor
     }
     // an interactive session (make run-window): no tests, straight to the console
-    if sysinfo(2)[1] != 0 && sysinfo(2)[3] == 0 {
+    if sysinfo(2)[1] != 0 && matches!(sysinfo(2)[3], 0 | 16) {
         programs::console_session();
     }
     // development shortcuts (make quick-bench / quick-sched): just one group of tests

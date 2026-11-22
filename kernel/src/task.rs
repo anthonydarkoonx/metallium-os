@@ -321,7 +321,7 @@ fn install(t: &mut Task, tid: usize, slot: usize, kind: Kind, obj: u16, rights: 
 
 /// The interactive boot (`make run-window`, no test mode) starts the session service: its endpoint is installed in the conductor and the screen task.
 pub fn sessions_in_boot() -> bool {
-    crate::platform::interactive() && crate::platform::only() == 0
+    crate::platform::interactive() && matches!(crate::platform::only(), 0 | 16) // (16: `make tty-session-test`, the interactive boot with a second account made by the conductor)
 }
 
 /// Initial capabilities per role: the kernel's static "system policy".
@@ -354,6 +354,10 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                     for k in 0..obj::TTY_BUFFERS - 1 {
                         install(t, tid, 18 + k, Kind::Endpoint, ipc::EP_TTY + k as u16, R_SEND); // (the consoles of ttys 1..3: told to start)
                     }
+                } else if sessions_in_boot() {
+                    for k in 0..obj::TTY_BUFFERS - 1 {
+                        install(t, tid, 18 + k, Kind::Endpoint, ipc::EP_TTY + k as u16, R_SEND); // (the consoles of ttys 1..3: told to run the greeter, then to start the session's console)
+                    }
                 } else if !crate::platform::interactive() {
                     for k in 0..ipc::BENCH_PAIRS {
                         install(t, tid, 16 + k, Kind::Endpoint, ipc::EP_BENCH_GO + k as u16, R_SEND);
@@ -382,7 +386,7 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
                 // chaos mode: the conductor drives a workload against every service and starts the monkey
                 install(t, tid, 14, Kind::Endpoint, ipc::EP_KBD, R_SEND);
                 install(t, tid, 22, Kind::Endpoint, ipc::EP_MONKEY, R_SEND);
-            } else if matches!(crate::platform::only(), 10 | 15) {
+            } else if matches!(crate::platform::only(), 10 | 15) || sessions_in_boot() {
                 install(t, tid, 14, Kind::Endpoint, ipc::EP_KBD, R_SEND); // (the USB input test: the conductor waits for input the way a desktop does)
             }
             if obj::gpu_present() {
@@ -477,6 +481,11 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
             install(t, tid, 5, Kind::Endpoint, ipc::EP_VFS, R_SEND);
             if let Some(p) = crate::spawn::boot_fs_page(tid) {
                 install(t, tid, 6, Kind::Memory, obj::OBJ_SHM_VFS_PROG0 + p as u16, R_MAP | R_WRITE);
+            }
+            if sessions_in_boot() {
+                // the greeter of the tty logs users in through the session service (the store's endpoint only answers its status calls to a task with a file page)
+                install(t, tid, 29, Kind::Endpoint, ipc::EP_SESSIONS, R_SEND);
+                install(t, tid, 30, Kind::Endpoint, ipc::EP_LFS, R_SEND);
             }
             install(t, tid, 8, Kind::Spawn, 0, R_SPAWN | R_SPAWN_FS | R_GRANT);
             install(t, tid, 9, Kind::Factory, 0, R_EP_CREATE | R_GRANT);

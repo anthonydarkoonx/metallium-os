@@ -60,7 +60,7 @@ chaos: kernel disk
 	 echo "== CHAOS (seed $(CHAOS_SEED)): ALL PASS ==" || { echo "== CHAOS (seed $(CHAOS_SEED)): FAILED (qemu rc=$$rc), see build-chaos.log =="; exit 1; }
 
 
-.PHONY: tty-test bigram-test greeter-test greeter-test-manager session-test-encrypted session-test table-test greeter-lib qemu-test-encrypted volume-test elf-boot-test usb-test usb-test-many usb-test-hub usb-test-noncoherent scale scale-run desktop-programs desktop-lib clippy stack-guard aslr-replay print-qemu quick-programs programs fuzz quick-bench quick-sched qemu-test-noncoherent chaos all user kernel disk erofs-check map-check qemu-test-up inherit-ab provenance-check run run-window test host-test qemu-test clean
+.PHONY: greeter-test-tty tty-test bigram-test greeter-test greeter-test-manager session-test-encrypted session-test table-test greeter-lib qemu-test-encrypted volume-test elf-boot-test usb-test usb-test-many usb-test-hub usb-test-noncoherent scale scale-run desktop-programs desktop-lib clippy stack-guard aslr-replay print-qemu quick-programs programs fuzz quick-bench quick-sched qemu-test-noncoherent chaos all user kernel disk erofs-check map-check qemu-test-up inherit-ab provenance-check run run-window test host-test qemu-test clean
 
 all: kernel
 
@@ -594,6 +594,12 @@ greeter-test:
 	@python3 tools/greeter-test.py '$(QEMU)'
 
 # ... and the interactive boot itself: a login starts the user's own program manager, and the console is given its control endpoint (no test mode; the conductor starts the service)
+# The same on two ttys (the conductor makes a second account; the test logs in on tty 1 with Ctrl+Alt+F2 and checks that session's console and program manager)
+greeter-test-tty:
+	@test -n "$(GREETER)" || { echo "greeter-test-tty needs GREETER=<the greeter repository>"; exit 1; }
+	@$(MAKE) --no-print-directory user kernel disk GREETER=$(GREETER) GREETER_FEATURES=log-key
+	@GREETER_MANAGER=1 GREETER_TTY=1 python3 tools/greeter-test.py '$(QEMU)'
+
 greeter-test-manager:
 	@test -n "$(GREETER)" || { echo "greeter-test-manager needs GREETER=<the greeter repository>"; exit 1; }
 	@$(MAKE) --no-print-directory user kernel disk GREETER=$(GREETER) GREETER_FEATURES=log-key

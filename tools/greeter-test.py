@@ -11,6 +11,7 @@ DISK = "build-greeter.img"
 SOCK = "build-greeter.sock"
 results = []
 MANAGER = os.environ.get("GREETER_MANAGER") == "1"
+TTY = os.environ.get("GREETER_TTY") == "1"  # (the interactive boot with a second account made by the conductor, `opt/metallium/only=16`: a second login on tty 1)
 
 
 def check(what, ok):
@@ -33,7 +34,7 @@ class Boot:
         c = re.sub(r"file=\S+?,format=raw", f"file={DISK},format=raw", cmd)
         c = c.replace("-nographic", f"-display none -serial file:{self.logname} -monitor none -qmp unix:{SOCK},server,nowait")
         # (GREETER_MANAGER=1: the interactive boot itself, with a program manager per session; else the test mode where the conductor only starts the session service)
-        c += ("" if MANAGER else " -fw_cfg name=opt/metallium/only,string=14") + " -fw_cfg name=opt/metallium/interactive,string=1"
+        c += (" -fw_cfg name=opt/metallium/only,string=16" if TTY else "" if MANAGER else " -fw_cfg name=opt/metallium/only,string=14") + " -fw_cfg name=opt/metallium/interactive,string=1"
         if os.path.exists(SOCK):
             os.remove(SOCK)
         open(self.logname, "w").close()
@@ -66,8 +67,8 @@ class Boot:
             time.sleep(0.5)
         return False
 
-    def key(self, qcode, shift=False, ctrl=False):
-        mods = (["ctrl"] if ctrl else []) + (["shift"] if shift else [])
+    def key(self, qcode, shift=False, ctrl=False, alt=False):
+        mods = (["ctrl"] if ctrl else []) + (["alt"] if alt else []) + (["shift"] if shift else [])
         ev = lambda k, d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": k}}}
         self.q({"execute": "input-send-event", "arguments": {"events": [ev(m, True) for m in mods] + [ev(qcode, True)]}})
         time.sleep(0.08)
@@ -127,13 +128,37 @@ if key:
     check("the right passphrase logs in and the greeter hands the screen on", b.wait("[greeter] done", 180))
     check("the session service started the administrator's session", "root logged in" in b.log())
     check("the screen task learns whose session has the screen (ACTIVE)", b.wait("has the screen", 30) and "nobody is logged in" not in b.log())
-    if MANAGER:
+    if MANAGER or TTY:
         check("the session has its own program manager, and the console is given its control endpoint", b.wait("[progmgr] starting", 60) and b.wait("session 1's program manager is task", 60))
         b.line("prog list")
         time.sleep(3)
         b.shot("5-console")
         log = b.log()
         check("the machine has no program manager of its own (the session service and the session's manager only)", log.count("[progmgr] starting") == 1 and "[progmgr] cannot set up" not in log)
+    if TTY:
+        check("the conductor made the second account", b.wait("[client] test: the account tester is made", 120) and "tester is made (replies 0 0): PASS" in b.log())
+        check("each of the other ttys has a console task with its input and buffer, and was asked for a login", b.wait("tty 3: console task", 60) and b.log().count("greeter asked (status 0)") == 3)
+        time.sleep(3)
+        b.key("f2", ctrl=True, alt=True)  # tty 1
+        time.sleep(3)
+        b.shot("7-tty1-login")
+        b.line("tester")
+        b.line("second-pass")
+        ok = b.wait("tty 1: session 2's program manager", 180)
+        check("a login on tty 1 starts that session's program manager and hands it to tty 1's console", ok)
+        check("tty 1's console started on its own buffer", ok and b.wait("its console started (status 0)", 30) and b.log().count("[shell] ready") == 2)
+        time.sleep(3)
+        b.shot("8-tty1-console")
+        b.line("prog list")
+        time.sleep(3)
+        b.shot("9-tty1-prog-list")
+        b.key("f1", ctrl=True, alt=True)
+        time.sleep(2)
+        b.line("prog list")
+        time.sleep(3)
+        b.shot("10-tty0-after")
+        log = b.log()
+        check("two sessions, each with its own program manager", log.count("[progmgr] starting") == 2 and "[progmgr] cannot set up" not in log)
     check("the recovery key was not written anywhere but the test's console line", len(re.findall(re.escape(key.group(1)), b.log())) == 1)
 b.stop()
 disk = open(DISK, "rb").read()

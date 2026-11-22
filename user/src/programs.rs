@@ -520,6 +520,7 @@ pub fn console_session() -> ! {
     let w2 = (disp_slot.max(0) as u64 & 0xFF) | (mgr.max(0) as u64) << 8 | (power_slot.max(0) as u64 & 0xFF) << 16;
     let (st, _) = call(23, [crate::info::INFO_CONSOLE, ctl_slot.max(0) as u64, w2]);
     println!("[client] interactive session: the console has the screen (status {st})");
+    let tty_consoles = if with_sessions { start_tty_greeters(sysinfo(2)[3] == 16) } else { alloc::vec::Vec::new() };
     // the second memory tier: the pager writes the coldest pages of the compressed store to a swap file on the data disk (bounded: kernel/src/pager.rs
     // lets at most WRITE_CAP_PER_HOUR pages an hour reach the flash), and reads them back when a program touches one
     let pager = v.read_file("/system/bin/pager").unwrap_or_default();
@@ -529,9 +530,53 @@ pub fn console_session() -> ! {
     } else {
         println!("[client] swap: no pager in the system image");
     }
+    // the consoles of the other ttys: when a user has logged in on one (its greeter did it), the session's manager is handed to that console, which starts on its own buffer
+    let mut started = [false; 3];
     loop {
-        sleep(60000);
+        for (i, &c) in tty_consoles.iter().enumerate() {
+            if started[i] {
+                continue;
+            }
+            let (st, r) = call(29, [6, c, 0]); // FROM: the session this console's greeter logged in
+            if st != 0 || r[0] & 0xFF != 0 {
+                continue;
+            }
+            let (id, m, slot) = ((r[0] >> 8) & 0xFFFF, (r[0] >> 24) & 0xFFFF, (r[0] >> 40) & 0xFF);
+            if m == 0 || slot == 0 {
+                continue;
+            }
+            let ctl = svc(5, slot, c, 0b101, 0, 0)[0] as i64; // CAP_GRANT to the console: send, and the right to give a copy to the programs it starts
+            let (st, _) = call(18 + i as u64, [crate::info::INFO_CONSOLE, ctl.max(0) as u64, m << 8]);
+            println!("[client] tty {}: session {id}'s program manager is task {m}, control endpoint in the console's slot {ctl}; its console started (status {st})", i + 1);
+            started[i] = true;
+        }
+        sleep(20);
     }
+}
+
+/// The consoles of ttys 1..3 (role 22), in tty order: each is given its tty's input and buffer, and asked to run the greeter there. `second_user` (the test mode `only=16`): the conductor makes the
+/// account "tester" (passphrase "second-pass") from the first user's session, so a test can log in on another tty (accounts are made only from an administrator's session and the greeter has no screen for it).
+fn start_tty_greeters(second_user: bool) -> alloc::vec::Vec<u64> {
+    let consoles: alloc::vec::Vec<u64> = (0..64u64).filter(|&t| { let r = sysinfo_at(3, t); r[0] as i64 == 0 && r[3] != 0 && r[5] == 22 }).collect();
+    if second_user {
+        let first = call(29, [5, 0, 0]);
+        let acting = (first.1[0] >> 8) & 0xFFFF;
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"tester");
+        let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+        let a = call(29, [1 | 1 << 8 | acting << 32, word(&name[..8]), word(&name[8..])]); // BEGIN, CREATE (acting session)
+        let mut secret = [0u8; 16];
+        secret[..11].copy_from_slice(b"second-pass");
+        let b = call(29, [2 | 11 << 8, word(&secret[..8]), word(&secret[8..])]);
+        println!("[client] test: the account tester is made (replies {} {}): {}", a.1[0], b.1[0] & 0xFF, verdict(a.0 == 0 && a.1[0] == 0 && b.0 == 0 && b.1[0] & 0xFF == 0));
+    }
+    for (i, &c) in consoles.iter().enumerate() {
+        let tty = i as u64 + 1;
+        let (a, b) = (call(14, [crate::proto::input::INPUT_ASSIGN, c, tty]), call(21, [crate::proto::gpu::GPU_BIND, c, tty]));
+        let g = call(18 + i as u64, [crate::info::INFO_GREETER, 0, 0]);
+        println!("[client] tty {tty}: console task {c} has its input and buffer (replies {} {}), greeter asked (status {})", a.1[0], b.1[0], g.0);
+    }
+    consoles
 }
 
 pub fn tests() {

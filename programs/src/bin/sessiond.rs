@@ -29,7 +29,8 @@ use metallium_programs::*;
 //   LOGOUT w0 = 3, w1 = session id
 //   STATUS w0 = 4 -> [number of users, number of sessions, 0]
 //   ACTIVE w0 = 5 -> [OK | session id << 8 | the session's program manager task << 24 | the parent's slot for its control endpoint << 40 (both 0 in test mode; the slot is in the *parent's* table: the conductor passes it on), w1 w2 = the user name (16 bytes, NUL padded)] of the newest live session, or [E_BAD, 0, 0] if there is none: the screen task asks it
-//          after the greeter returns, to learn whose session has the screen (until each session has its own screen, the newest login has it)
+//   FROM   w0 = 6, w1 = a task id -> as ACTIVE, for the session that task logged in (the greeter of a tty: the conductor hands that tty's console the session's manager), or [E_BAD, 0, 0]
+//          (ACTIVE: the screen task asks it after the greeter returns, to learn whose session has the screen (until each session has its own screen, the newest login has it)
 // Actions: CREATE (secret: the passphrase; reply w0 = status | uid << 8, w1 w2 = the recovery key: show it once), LOGIN (the passphrase; reply w1 = the session id),
 // RESET (the 16 recovery-key bytes: opens the account's domain for a following SETPASS), SETPASS (the new passphrase: after a RESET, or by the user's own session `acting`).
 const OP_BEGIN: u64 = 1;
@@ -37,6 +38,7 @@ const OP_SECRET: u64 = 2;
 const OP_LOGOUT: u64 = 3;
 const OP_STATUS: u64 = 4;
 const OP_ACTIVE: u64 = 5;
+const OP_FROM: u64 = 6;
 const ACT_CREATE: u64 = 1;
 const ACT_LOGIN: u64 = 2;
 const ACT_RESET: u64 = 3;
@@ -84,6 +86,8 @@ struct Session {
     id: u64,
     uid: u32,
     name: String,
+    /// The task that completed the login (a tty's greeter).
+    by: u64,
     /// The manager's control endpoint (mine) and the parent's slot for it: only with a screen task.
     ctl: Option<(Endpoint, u64)>,
     child: Child,
@@ -123,8 +127,8 @@ struct Svc {
     accounts: Vec<Account>,
     sessions: Vec<Session>,
     next_session: u64,
-    /// The request being assembled: (action, role, acting session, name, secret so far).
-    pending: Option<(u64, bool, u64, String, Vec<u8>)>,
+    /// The request being assembled: (sender, action, role, acting session, name, secret so far). One sender at a time: a BEGIN from another task replaces it.
+    pending: Option<(u64, u64, bool, u64, String, Vec<u8>)>,
     /// The account whose domain a recovery key has just opened (a SETPASS must follow).
     resetting: Option<u32>,
 }
@@ -193,7 +197,7 @@ impl Svc {
         [OK | (uid as u64) << 8, recovery[0], recovery[1]]
     }
 
-    fn login(&mut self, name: &str, pass: &[u8]) -> [u64; 3] {
+    fn login(&mut self, by: u64, name: &str, pass: &[u8]) -> [u64; 3] {
         let Some(a) = self.accounts.iter().find(|a| a.name == name) else {
             dummy_work(pass);
             return [E_LOGIN, 0, 0];
@@ -241,7 +245,7 @@ impl Svc {
         self.next_session += 1;
         let id = self.next_session;
         println!("[sessiond] {name} logged in: session {id} (task {})", child.id());
-        self.sessions.push(Session { id, uid, name: name.clone(), ctl, child });
+        self.sessions.push(Session { id, uid, name: name.clone(), by, ctl, child });
         [OK, id, 0]
     }
 
@@ -293,7 +297,14 @@ impl Svc {
         [OK, 0, 0]
     }
 
-    fn request(&mut self, w: [u64; 3]) -> [u64; 3] {
+    fn describe(s: &Session) -> [u64; 3] {
+        let mut raw = [0u8; 16];
+        raw[..s.name.len().min(16)].copy_from_slice(&s.name.as_bytes()[..s.name.len().min(16)]);
+        let (slot, mgr) = (s.ctl.as_ref().map_or(0, |c| c.1), if s.ctl.is_some() { s.child.id() as u64 } else { 0 });
+        [OK | s.id << 8 | (mgr & 0xFFFF) << 24 | (slot & 0xFF) << 40, u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap())]
+    }
+
+    fn request(&mut self, sender: u64, w: [u64; 3]) -> [u64; 3] {
         match w[0] & 0xFF {
             OP_BEGIN => {
                 let mut raw = [0u8; 16];
@@ -305,12 +316,15 @@ impl Svc {
                 if !matches!(action, ACT_CREATE | ACT_LOGIN | ACT_RESET | ACT_SETPASS) {
                     return [E_BAD, 0, 0];
                 }
-                self.pending = Some((action, (w[0] >> 16) & 0xFF == 1, (w[0] >> 32) & 0xFFFF_FFFF, String::from(name), Vec::new()));
+                self.pending = Some((sender, action, (w[0] >> 16) & 0xFF == 1, (w[0] >> 32) & 0xFFFF_FFFF, String::from(name), Vec::new()));
                 [OK, 0, 0]
             }
             OP_SECRET => {
                 let (total, offset) = (((w[0] >> 8) & 0xFFFF) as usize, ((w[0] >> 24) & 0xFFFF) as usize);
-                let Some((action, admin, acting, name, mut secret)) = self.pending.take() else { return [E_BAD, 0, 0] };
+                let Some((from, action, admin, acting, name, mut secret)) = self.pending.take() else { return [E_BAD, 0, 0] };
+                if from != sender {
+                    return [E_BAD, 0, 0]; // (another task's request was in the way: that one is dropped, this one must start again)
+                }
                 if total == 0 || total > 128 || offset != secret.len() || offset % 16 != 0 || offset >= total {
                     self.pending = None;
                     return [E_BAD, 0, 0];
@@ -320,12 +334,12 @@ impl Svc {
                 chunk[8..].copy_from_slice(&w[2].to_le_bytes());
                 secret.extend_from_slice(&chunk[..(total - offset).min(16)]);
                 if secret.len() < total {
-                    self.pending = Some((action, admin, acting, name, secret));
+                    self.pending = Some((sender, action, admin, acting, name, secret));
                     return [E_MORE, 0, 0];
                 }
                 let r = match action {
                     ACT_CREATE => self.create(&name, admin, acting, &secret),
-                    ACT_LOGIN => self.login(&name, &secret),
+                    ACT_LOGIN => self.login(sender, &name, &secret),
                     ACT_RESET => self.reset(&name, &secret),
                     _ => self.setpass(acting, &secret),
                 };
@@ -334,15 +348,8 @@ impl Svc {
             }
             OP_LOGOUT => self.logout(w[1]),
             OP_STATUS => [self.accounts.len() as u64, self.sessions.len() as u64, 0],
-            OP_ACTIVE => match self.sessions.last() {
-                Some(s) => {
-                    let mut raw = [0u8; 16];
-                    raw[..s.name.len().min(16)].copy_from_slice(&s.name.as_bytes()[..s.name.len().min(16)]);
-                    let (slot, mgr) = (s.ctl.as_ref().map_or(0, |c| c.1), if s.ctl.is_some() { s.child.id() as u64 } else { 0 });
-                    [OK | s.id << 8 | (mgr & 0xFFFF) << 24 | (slot & 0xFF) << 40, u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap())]
-                }
-                None => [E_BAD, 0, 0],
-            },
+            OP_ACTIVE => self.sessions.last().map_or([E_BAD, 0, 0], Self::describe),
+            OP_FROM => self.sessions.iter().rev().find(|s| s.by == w[1]).map_or([E_BAD, 0, 0], Self::describe),
             _ => [E_BAD, 0, 0],
         }
     }
@@ -356,7 +363,7 @@ program!("sessiond", |_c| {
     loop {
         match ctl.recv() {
             Ok(r) => {
-                let rep = svc.request(r.words);
+                let rep = svc.request(r.sender, r.words);
                 if r.is_call {
                     let _ = ipc::reply(rep);
                 }

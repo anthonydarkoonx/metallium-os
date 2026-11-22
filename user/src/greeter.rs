@@ -90,7 +90,7 @@ fn present() {
 pub fn unlock_screen(fb: *mut u32) {
     let locked = volume_status().map_or(false, |(s, _)| s == state::LOCKED);
     // (a session service is started in the interactive boot and in the test mode `only=14`: a call on an endpoint nobody receives on would wait for ever, so the slot is passed on only there)
-    let sessions = if sysinfo(2)[3] == 14 || (sysinfo(2)[1] != 0 && sysinfo(2)[3] == 0) { SL_SESSIONS } else { 0 };
+    let sessions = if sysinfo(2)[3] == 14 || (sysinfo(2)[1] != 0 && matches!(sysinfo(2)[3], 0 | 16)) { SL_SESSIONS } else { 0 };
     #[cfg(greeter)]
     if locked || sessions != 0 {
         println!("[greeter] handing the screen to the greeter");
