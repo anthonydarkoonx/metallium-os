@@ -36,7 +36,7 @@ text:   grep [-v -i -c] TEXT   (plain text, no regex)
         wc [-l]  head/tail [-n N]  sort [-r]
 edit:   edit FILE  (or nano FILE): a small text editor, keys as in nano
         ^O write out  ^X exit  ^K cut line  ^U paste  ^W search  ^G help
-system: ps free uptime fetch clear help
+system: ps free uptime fetch clear help logout
 net:    download http://host/path [FILE]   (plain HTTP)
 sound:  play [-v PERCENT] FILE.wav|http://URL   (PCM, any rate; Ctrl-C stops)
         play -t [HZ [SECONDS]]       (test tone)
@@ -68,6 +68,8 @@ pub struct Shell {
     stdout: Option<u64>,
     /// My slot holding a send capability to the program manager's control endpoint (the conductor hands it over), if it runs.
     pub progmgr: Option<u64>,
+    /// The user asked to log out and the session service ended the session: the console returns to the greeter.
+    pub logout: bool,
     host: Host,
     /// The full-screen editor, while `edit` runs (it takes every key until it exits), and the screen to put back when it does.
     edit: Option<TermEdit>,
@@ -172,7 +174,7 @@ impl Shell {
     pub unsafe fn new(fb: *mut u32, facts: Facts, host: Host) -> Shell {
         // SAFETY: forwarded from `Shell::new`'s contract: `fb` is valid for `Console::new`.
         let con = unsafe { Console::new(fb) };
-        Shell { con, vfs: Vfs::new(5, SHELL_SHM), cwd: String::from("/"), line: String::new(), hist: Vec::new(), hist_at: 0, facts, stdout: None, progmgr: None, host, edit: None, saved_screen: None }
+        Shell { con, vfs: Vfs::new(5, SHELL_SHM), cwd: String::from("/"), line: String::new(), hist: Vec::new(), hist_at: 0, facts, stdout: None, progmgr: None, logout: false, host, edit: None, saved_screen: None }
     }
 
     /// Draw the first screen: banner, the machine summary, a prompt.
@@ -450,6 +452,14 @@ impl Shell {
         let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
         match name {
             "help" => Ok(String::from(HELP)),
+            "logout" => {
+                if crate::greeter::logout() {
+                    self.logout = true;
+                    Ok(String::new())
+                } else {
+                    Err(String::from("logout: not logged in\n"))
+                }
+            }
             "echo" => Ok(format!("{}\n", args.join(" "))),
             "pwd" => Ok(format!("{}\n", self.cwd)),
             "uptime" => Ok(format!("up {}\n", info::uptime(&self.facts))),

@@ -34,6 +34,21 @@ pub fn active_session() -> Option<(u64, alloc::string::String)> {
     Some((id, alloc::string::String::from_utf8_lossy(&raw[..n]).into_owned()))
 }
 
+/// End the session this console was given (`LOGOUT`): the session service kills the session's tasks and locks the user's files again. False if there is no session or the service refused.
+pub fn logout() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let id = ACTIVE_ID.load(Relaxed);
+    if id == 0 || (sysinfo(2)[1] == 0) {
+        return false;
+    }
+    let (st, r) = call(SL_SESSIONS, [3, id, 0]);
+    let ok = st == 0 && r[0] == 0;
+    if ok {
+        ACTIVE_ID.store(0, Relaxed);
+    }
+    ok
+}
+
 /// Ask the session service whose session is the newest (`ACTIVE`, programs/src/bin/sessiond.rs): `(id, name words)`, or `None` if nobody is logged in.
 fn ask_active() -> Option<(u64, [u64; 2])> {
     let (st, r) = call(SL_SESSIONS, [5, 0, 0]);

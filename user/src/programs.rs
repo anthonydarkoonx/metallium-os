@@ -531,14 +531,32 @@ pub fn console_session() -> ! {
         println!("[client] swap: no pager in the system image");
     }
     // the consoles of the other ttys: when a user has logged in on one (its greeter did it), the session's manager is handed to that console, which starts on its own buffer
-    let mut started = [false; 3];
+    // (and tty 0's: its console was started above; a logout there brings the greeter back, and the next login is handed over the same way)
+    let (mut started, mut started0) = ([false; 3], true);
     loop {
-        for (i, &c) in tty_consoles.iter().enumerate() {
-            if started[i] {
-                continue;
+        if let (Some(d), true) = (desk, with_sessions) {
+            let (st, r) = call(29, [6, d, 0]);
+            let live = st == 0 && r[0] & 0xFF == 0;
+            let (id, m, slot) = ((r[0] >> 8) & 0xFFFF, (r[0] >> 24) & 0xFFFF, (r[0] >> 40) & 0xFF);
+            if started0 && !live {
+                started0 = false;
+                println!("[client] tty 0: the session ended; the console is back at the greeter");
+            } else if !started0 && live && m != 0 && slot != 0 {
+                let ctl = svc(5, slot, d, 0b101, 0, 0)[0] as i64;
+                let w2 = (disp_slot.max(0) as u64 & 0xFF) | m << 8 | (power_slot.max(0) as u64 & 0xFF) << 16;
+                let (st, _) = call(23, [crate::info::INFO_CONSOLE, ctl.max(0) as u64, w2]);
+                println!("[client] tty 0: session {id}'s program manager is task {m}, control endpoint in the console's slot {ctl}; its console started (status {st})");
+                started0 = true;
             }
+        }
+        for (i, &c) in tty_consoles.iter().enumerate() {
             let (st, r) = call(29, [6, c, 0]); // FROM: the session this console's greeter logged in
-            if st != 0 || r[0] & 0xFF != 0 {
+            let live = st == 0 && r[0] & 0xFF == 0;
+            if started[i] && !live {
+                started[i] = false;
+                println!("[client] tty {}: the session ended; the console is back at the greeter", i + 1);
+            }
+            if started[i] || !live {
                 continue;
             }
             let (id, m, slot) = ((r[0] >> 8) & 0xFFFF, (r[0] >> 24) & 0xFFFF, (r[0] >> 40) & 0xFF);

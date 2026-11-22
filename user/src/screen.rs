@@ -63,7 +63,11 @@ fn desktop(w2: u64) {
 #[cfg(not(desktop))]
 fn desktop(_w2: u64) {}
 
-pub fn run(facts: crate::info::Facts, ctl: u64, w2: u64) -> ! {
+/// The terminal's pixels, made once: a console that goes back to the greeter and starts again must not leave a buffer behind each time.
+static mut TERM: Option<&'static mut [u32]> = None;
+
+/// Run the console until the user logs out (which returns); without a session service it does not return.
+pub fn run(facts: crate::info::Facts, ctl: u64, w2: u64) {
     desktop(w2);
     if mem_map(2, FB_VA, true) != 0 {
         println!("[console] cannot map the framebuffer");
@@ -71,7 +75,9 @@ pub fn run(facts: crate::info::Facts, ctl: u64, w2: u64) -> ! {
     }
     let fb = va(FB_VA) as *mut u32;
     let (tw, th) = (crate::console::WIDTH, crate::console::HEIGHT);
-    let term_buf: &'static mut [u32] = Box::leak(vec![crate::console::themed(crate::console::BG); tw * th].into_boxed_slice());
+    // SAFETY: the screen task is single-threaded; nothing else touches `TERM`, and the buffer it holds is used only by the shell started below, which is gone when this returns.
+    let term_buf: &'static mut [u32] = unsafe { (*core::ptr::addr_of_mut!(TERM)).take() }.unwrap_or_else(|| Box::leak(vec![0u32; tw * th].into_boxed_slice()));
+    term_buf.fill(crate::console::themed(crate::console::BG));
     let (ox, oy) = (W.saturating_sub(tw) / 2, H.saturating_sub(th) / 2);
     // SAFETY: the scanout buffer is `W * H` words.
     unsafe { core::slice::from_raw_parts_mut(fb, W * H) }.fill(BACKDROP);
@@ -83,6 +89,12 @@ pub fn run(facts: crate::info::Facts, ctl: u64, w2: u64) -> ! {
     println!("[console] up: terminal only, no windowing system");
     let mut last_active = 0u64;
     loop {
+        if shell.logout {
+            println!("[console] logged out");
+            // SAFETY: as above.
+            unsafe { *core::ptr::addr_of_mut!(TERM) = Some(core::slice::from_raw_parts_mut(term_buf.as_mut_ptr(), tw * th)) };
+            return;
+        }
         let shown = present(fb, term_buf, ox, oy);
         let keys = take_keys();
         let typed = !keys.is_empty();

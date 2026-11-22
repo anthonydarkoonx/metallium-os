@@ -101,7 +101,9 @@ pub fn info_task() -> ! {
             }
             INFO_CONSOLE => {
                 reply([0, 0, 0]);
-                crate::screen::run(gather(), m.w[1], m.w[2])
+                crate::screen::run(gather(), m.w[1], m.w[2]);
+                // the user logged out: the greeter again, on this tty's buffer (a new login is handed to the console by the conductor)
+                crate::greeter::unlock_screen(fb);
             }
             _ => {
                 reply([1, 0, 0]);
@@ -127,7 +129,9 @@ pub fn tty_console_task() -> ! {
             }
             INFO_CONSOLE => {
                 reply([0, 0, 0]);
-                crate::screen::run(gather(), m.w[1], m.w[2])
+                crate::screen::run(gather(), m.w[1], m.w[2]);
+                // (the user logged out: back to the greeter; the conductor sees the session is gone and starts the console again for the next one)
+                crate::greeter::unlock_screen(va(FB_VA) as *mut u32);
             }
             _ => {
                 reply([1, 0, 0]);
