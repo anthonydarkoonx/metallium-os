@@ -38,6 +38,8 @@ pub mod ctl;
 pub mod heap;
 pub mod io;
 pub mod ipc;
+// the network client API (sockets, name lookup, ping) lives in the networking repository, checked out next to this one
+#[path = "../../../metallium-networking-userspace/client/net.rs"]
 pub mod net;
 pub mod process;
 pub mod random;

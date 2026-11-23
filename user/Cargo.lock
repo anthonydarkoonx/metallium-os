@@ -66,6 +66,19 @@ name = "metallium-net"
 version = "0.1.0"
 
 [[package]]
+name = "metallium-net-ring"
+version = "0.1.0"
+
+[[package]]
+name = "metallium-net-services"
+version = "0.1.0"
+dependencies = [
+ "metallium-driver-rt",
+ "metallium-net",
+ "metallium-net-ring",
+]
+
+[[package]]
 name = "metallium-rand"
 version = "0.1.0"
 
@@ -86,7 +99,7 @@ dependencies = [
  "metallium-input",
  "metallium-lfs",
  "metallium-loader",
- "metallium-net",
+ "metallium-net-services",
  "metallium-usb",
 ]
 

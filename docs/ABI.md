@@ -226,7 +226,7 @@ because the service was restarted: it wakes every session when it starts). An id
 | 130 DNS_START, 131 DNS_RESULT, 132 DNS_RELEASE | the name in the page (`w1` = length) → query; the result is a count and 4-byte addresses in the page |
 
 `programs/src/net.rs` wraps this as `UdpSocket`, `TcpStream`, `TcpListener`, `lookup_host`, `ping` and `config`. The network
-driver (`netdrv`) and `netd` share a page of rings and the packet buffers (`user/src/netring.rs`); `netd` wakes the driver
+driver (`netdrv`) and `netd` share a page of rings and the packet buffers (`metallium-net-ring`, in the networking repository); `netd` wakes the driver
 with `IRQ_RAISE`, the driver wakes `netd` with a message to its endpoint.
 
 ## Files

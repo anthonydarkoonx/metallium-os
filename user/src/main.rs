@@ -32,7 +32,6 @@ mod chaos;
 mod console;
 mod screen;
 mod font;
-mod httpc;
 mod blk;
 mod gpu;
 mod gputest;
@@ -43,12 +42,12 @@ mod kbd;
 mod xhci;
 mod greeter;
 mod logo;
-mod netd;
-mod netdrv;
 mod shell;
 mod termedit;
 mod compaction;
-pub use metallium_driver_rt::{dma, netring, proto, virtio};
+pub use metallium_driver_rt::{dma, proto, virtio};
+// the network service, its driver and the HTTP client live in the networking repository (see its README.md)
+pub use metallium_net_services::{httpc, netd, netdrv};
 mod heap;
 mod ring;
 mod sched;
@@ -57,17 +56,6 @@ mod vfs;
 
 fn verdict(ok: bool) -> &'static str {
     if ok { "PASS" } else { "FAIL" }
-}
-
-/// A private copy of bytes a client can change at any time (a session page). Parse the copy, never the page: a check made on
-/// the page proves nothing about what is there when the bytes are used.
-pub fn snapshot<const N: usize>(src: &[u8]) -> [u8; N] {
-    let mut out = [0u8; N];
-    for (i, o) in out.iter_mut().enumerate().take(src.len()) {
-        // SAFETY: `i < src.len()`; volatile so each byte is read exactly once.
-        *o = unsafe { read_volatile(src.as_ptr().add(i)) };
-    }
-    out
 }
 
 fn sum_bytes(p: *const u8, len: usize) -> u64 {

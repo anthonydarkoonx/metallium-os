@@ -130,7 +130,3 @@ pub mod input {
     pub const K_ATTENTION: u8 = 0x90;
 }
 
-/// The network driver (role 18); the rings it shares with `netd` are in `netring`.
-pub mod net {
-    pub const NET_EVENT: u64 = 0x100;
-}

@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn the_network_queues_fit_one_page_each() {
-        use crate::netring::{NRX, NTX};
+        use metallium_net_ring::{NRX, NTX};
         assert!(packed_layout(NRX as u16).is_some());
         assert!(packed_layout(NTX as u16).is_some());
         // (the transmit queue starts one page after the receive queue)

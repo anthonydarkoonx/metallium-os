@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+# (a host test checks that the network driver's queues fit a page; the ring layout is in the networking repository, checked out next to this one)
+metallium-net-ring = { path = "../../../metallium-networking-userspace/crates/metallium-net-ring" }
+
 [lints]
 workspace = true

@@ -21,7 +21,7 @@ SCHED_PAT := 'TEST Heavy work stays on performance cores when they are not overs
 else
 SCHED_PAT := '(Heavy): no performance cores online'
 endif
-# Host port forwarded to the guest's TCP port 7777 (the inbound connection of the network tests); tools/netpeer.py uses it.
+# Host port forwarded to the guest's TCP port 7777 (the inbound connection of the network tests); $(NET_REPO)/tools/netpeer.py uses it.
 NET_FWD_PORT ?= 18077
 # the input devices: virtio keyboard and tablet (the USB test swaps them for an xHCI controller with a USB keyboard and tablet)
 QEMU_INPUT := -device virtio-keyboard-pci,disable-legacy=on,iommu_platform=on -device virtio-tablet-pci,disable-legacy=on,iommu_platform=on
@@ -46,8 +46,11 @@ QEMU     := qemu-system-aarch64 -fw_cfg name=opt/metallium/seed,file=$(SEED_FILE
 print-qemu:
 	@echo '$(QEMU)'
 
-# The network tests need the host peer (tools/netpeer.py) running while the guest boots.
-WITH_PEER := tools/with-peer.sh $(NET_FWD_PORT)
+# The network service, its driver, the stack, the client API, the network programs and the host peer live in the networking repository,
+# checked out next to this one (the Cargo manifests name it as ../../metallium-networking-userspace).
+NET_REPO ?= ../metallium-networking-userspace
+# The network tests need the host peer ($(NET_REPO)/tools/netpeer.py) running while the guest boots.
+WITH_PEER := $(NET_REPO)/tools/with-peer.sh $(NET_FWD_PORT)
 
 # Chaos test: a monkey kills services at random while a workload uses them; see user/src/chaos.rs.
 CHAOS_SEED ?= 1

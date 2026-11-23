@@ -24,6 +24,9 @@ dependencies = [
 [[package]]
 name = "metallium-driver-rt"
 version = "0.1.0"
+dependencies = [
+ "metallium-net-ring",
+]
 
 [[package]]
 name = "metallium-ed25519"
@@ -73,7 +76,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "metallium-net"
+name = "metallium-net-ring"
 version = "0.1.0"
 
 [[package]]

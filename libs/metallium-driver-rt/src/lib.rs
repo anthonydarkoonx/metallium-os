@@ -8,7 +8,6 @@
 extern crate alloc;
 
 pub mod dma;
-pub mod netring;
 pub mod proto;
 pub mod virtio;
 
@@ -247,3 +246,13 @@ pub fn exit(code: u64) -> ! {
     loop {}
 }
 
+/// A private copy of bytes a client can change at any time (a session page). Parse the copy, never the page: a check made on
+/// the page proves nothing about what is there when the bytes are used.
+pub fn snapshot<const N: usize>(src: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate().take(src.len()) {
+        // SAFETY: `i < src.len()`; volatile so each byte is read exactly once.
+        *o = unsafe { read_volatile(src.as_ptr().add(i)) };
+    }
+    out
+}

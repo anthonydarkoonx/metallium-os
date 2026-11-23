@@ -9,9 +9,15 @@ fn main() {
                 println!("cargo:rustc-link-arg-bin={n}=-soname={n}");
             }
         }
+        // (the network programs are built from the networking repository, see Cargo.toml)
+        for n in ["nettest", "netcheck", "fetch"] {
+            println!("cargo:rustc-link-arg-bin={n}=-soname={n}");
+        }
     }
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=link-pie.ld");
     println!("cargo:rerun-if-changed=src/bin");
+    println!("cargo:rerun-if-changed=../../metallium-networking-userspace/programs");
+    println!("cargo:rerun-if-changed=../../metallium-networking-userspace/client");
     println!("cargo:rerun-if-env-changed=METALLIUM_PIE");
 }

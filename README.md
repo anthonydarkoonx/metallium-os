@@ -33,6 +33,7 @@ ported from Linux and U-Boot, is a separate GPL-2.0-only repository: [metallium-
 | `libs/metallium-gfx` | 2D drawing primitives and the bitmap/outline typefaces; the terminal draws its text with it. The OS ships no window system: it is meant to run one (a window manager or desktop environment) as ordinary user programs; see `docs/DESKTOP-INTERFACE.md` |
 | `libs/metallium-input` | device-neutral input events: pointer (mouse/touch/pen) and key events in 24.8 fixed point, the translator for the drivers' packed words, the gesture recogniser (tap, context menu, pan, fling, pinch). Host-tested, for a window system to use |
 | `libs/metallium-fdt` | flattened device tree reader (RAM, cores and their speeds, GIC, PSCI conduit); host-tested on real QEMU trees and damaged copies |
+| *networking (separate repository)* | [metallium-networking-userspace](https://github.com/anthonydarkoonx/metallium-networking-userspace): the IP stack (`metallium-net`), the network service `netd`, the virtio-net driver `netdrv`, the HTTP client, the client API and test programs, and the host peer; see its `README.md` |
 | `libs/metallium-usb` | USB input without hardware: HID descriptor and report parsing, key tables; host-tested |
 | `libs/metallium-ed25519` | SHA-512 and Ed25519 signature verification (RFC 8032), no heap |
 | `libs/metallium-sched` | big.LITTLE placement policy; the kernel feeds it a mock topology |
@@ -244,7 +245,7 @@ exit code. `stdtest` (an 8-section program, ~80 checks) runs all of it under QEM
 endpoint, children whose output is captured, and a check that no frame or capability node is left behind.
 
 ## Networking
-The stack is written from the RFCs (`libs/metallium-net`, `no_std`, driven by its caller: frames in, time in, frames out):
+The networking code lives in its own repository, [metallium-networking-userspace](https://github.com/anthonydarkoonx/metallium-networking-userspace), which has to be checked out next to this one (the Cargo manifests and the Makefile refer to `../metallium-networking-userspace`). The stack is written from the RFCs (`crates/metallium-net` there, `no_std`, driven by its caller: frames in, time in, frames out):
 Ethernet and ARP, IPv4 with fragment reassembly, ICMP echo and errors, UDP, **TCP** (RFC 9293 state machine with
 RFC 5961 blind-reset protection, window scaling, Nagle, delayed ACKs, RFC 6298 retransmission timer, RFC 5681/6582 slow
 start, congestion avoidance, fast retransmit and NewReno recovery, zero-window probes; no SACK or timestamps yet), a
@@ -261,7 +262,7 @@ pages; it parses nothing. `netd` (role 19) owns the stack, speaks the session pr
 program that was started with the network flag its own handles, which it closes when the program ends. A new
 `IRQ_RAISE` call lets the service wake the driver as if the device had interrupted. Under QEMU's user-mode network the
 guest gets 10.0.2.15 by DHCP, pings the gateway, resolves names, and runs TCP at 14-19 MB/s against a Python peer
-(`tools/netpeer.py`) on the host: 1 MiB echoed byte for byte, 2 MiB down and up with a checksum, 60 connections in a
+(`tools/netpeer.py` in that repository) on the host: 1 MiB echoed byte for byte, 2 MiB down and up with a checksum, 60 connections in a
 row, four threads with a connection each, a listener the host reaches through a port forward, sockets abandoned by a
 program that exits, and `netd` killed while a connection is open. `make quick-net` runs just those.
 

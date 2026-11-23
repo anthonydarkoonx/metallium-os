@@ -12,6 +12,19 @@ metallium-loader = { path = "../libs/metallium-loader" }
 metallium-map = { path = "../libs/metallium-map" }
 metallium-crypt = { path = "../libs/metallium-crypt" }
 
+# The network programs (tests and tools for the network service) are in the networking repository, checked out next to this one.
+[[bin]]
+name = "nettest"
+path = "../../metallium-networking-userspace/programs/nettest.rs"
+
+[[bin]]
+name = "netcheck"
+path = "../../metallium-networking-userspace/programs/netcheck.rs"
+
+[[bin]]
+name = "fetch"
+path = "../../metallium-networking-userspace/programs/fetch.rs"
+
 [profile.release]
 panic = "abort"
 opt-level = "s"

@@ -11,7 +11,8 @@ metallium-erofs = { path = "../libs/metallium-erofs" }
 metallium-lfs = { path = "../libs/metallium-lfs" }
 metallium-crypt = { path = "../libs/metallium-crypt" }
 metallium-loader = { path = "../libs/metallium-loader" }
-metallium-net = { path = "../libs/metallium-net" }
+# the network service, its driver and the HTTP client: the networking repository, checked out next to this one
+metallium-net-services = { path = "../../metallium-networking-userspace/services" }
 metallium-gfx = { path = "../libs/metallium-gfx" }
 metallium-input = { path = "../libs/metallium-input" }
 metallium-edit = { path = "../libs/metallium-edit" }

@@ -27,13 +27,13 @@ from memory and **must be checked against each board's documentation** before re
 | PCIe | `pci.rs` (ECAM 0x40_1000_0000, window 0x1000_0000..0x3eff_0000, only virtio vendor 0x1af4 matched) | firmware-free, ready-made host bridge | a host-controller driver and window set-up per SoC (if the board's devices hang off PCIe at all) |
 | IOMMU | `smmu.rs` (SMMUv3 at 0x0905_0000) | an Arm SMMUv3 confines every user-space driver's DMA | most SBC SoCs do not have one (some have a vendor IOMMU, a few an SMMU). Without it a user-space driver with a DMA-capable device can reach any memory, which weakens the "drivers are ordinary confined programs" story (see below) |
 | Entropy | `virtio_rng.rs`, `rand.rs` | a virtio-rng device; `RNDR` if the CPU has it (ARMv8.5, so not on A53/A55/A72) | the SoC's hardware random generator driver, for ASLR/KASLR quality |
-| Drivers | `user/src/virtio.rs`, `storage.rs`, `gpu.rs`, `kbd.rs`, `netdrv.rs` (about 1.6k lines): virtio block, GPU, input and net over PCI | virtio devices | one replacement per board and device, below |
+| Drivers | `user/src/virtio.rs`, `storage.rs`, `gpu.rs`, `kbd.rs`, `netdrv.rs` (now in the networking repository, `services/src/`; about 1.6k lines together): virtio block, GPU, input and net over PCI | virtio devices | one replacement per board and device, below |
 
 ### The drivers a board needs (the real work)
 1. **Storage:** an SD/eMMC controller (SDHCI, Arasan, DesignWare MMC or a Broadcom/Rockchip variant) plus clocks.
 2. **Display:** start with the framebuffer the firmware leaves (a "simple framebuffer": address, size, stride from the device tree or firmware); a real HDMI/DSI driver is far larger. The terminal session (`user/src/desktop.rs`) already draws into a framebuffer and flushes rectangles, so it needs only a driver that shows a rectangle (the `GPU_FLUSH` / `GPU_FLUSH2` protocol; on a plain framebuffer a flush is a cache clean).
 3. **Input:** USB keyboard and mouse need a USB host controller stack (xHCI or DWC2) and HID: the largest single item. A serial-only shell is the first milestone.
-4. **Network:** the SoC's Ethernet MAC (or a PCIe NIC) plus PHY set-up; the stack in `libs/metallium-net` is independent of it.
+4. **Network:** the SoC's Ethernet MAC (or a PCIe NIC) plus PHY set-up; the stack (`metallium-net`, in the networking repository) is independent of it.
 5. **Platform plumbing** (clocks, resets, pin mux, regulators) that firmware may or may not have done.
 
 ## Suggested order
