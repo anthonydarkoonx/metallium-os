@@ -447,7 +447,7 @@ fn worker() -> ! {
 pub extern "C" fn _start(role: u64, arg1: u64) -> ! {
     // The services take their memory where the kernel puts it, and the kernel agrees to nothing else (see `mem_map`).
     // The test programs (conductor, the test server, fuzzer, benchmarks, the monkey, the application) keep explicit addresses.
-    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20 | 22) {
+    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20 | 21 | 22) {
         auto_maps();
     }
     match role {
@@ -461,6 +461,7 @@ pub extern "C" fn _start(role: u64, arg1: u64) -> ! {
         14 => kbd::kbd_driver(),
         18 => netdrv::net_driver(),
         20 => audiod::audiod(),
+        21 => metallium_entropy::rng_driver(),
         19 => netd::netd(),
         15 => chaos::monkey(),
         5 => storage::rofs_server(),

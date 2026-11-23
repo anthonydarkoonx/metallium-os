@@ -34,6 +34,13 @@ name = "metallium-edit"
 version = "0.1.0"
 
 [[package]]
+name = "metallium-entropy"
+version = "0.1.0"
+dependencies = [
+ "metallium-driver-rt",
+]
+
+[[package]]
 name = "metallium-erofs"
 version = "0.1.0"
 dependencies = [
@@ -94,6 +101,7 @@ dependencies = [
  "metallium-crypt",
  "metallium-driver-rt",
  "metallium-edit",
+ "metallium-entropy",
  "metallium-erofs",
  "metallium-gfx",
  "metallium-input",

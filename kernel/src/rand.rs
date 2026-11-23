@@ -9,8 +9,9 @@
 //!  * the system counter and the machine ID (weak: that is all there is without the other two).
 //! After boot, the time of every interrupt is folded in as well.
 //!
-//! Later, when the buses are probed, the kernel reads 32 bytes from a virtio-rng device if there is one (`virtio_rng.rs`)
-//! and folds them in (not in the debugging modes below, which promise a layout that depends on nothing else).
+//! Later, the entropy driver (a user-space task, role 21, for a virtio-rng device if there is one) hands the kernel 32 bytes with
+//! `ADD_ENTROPY` and folds them in again from time to time (not in the debugging modes below, which promise a layout that depends
+//! on nothing else). Tasks made before its first delivery are laid out from the sources above only.
 //!
 //! For debugging there are three modes that give up unpredictability on purpose:
 //!  * `opt/metallium/noaslr=1`: every layout is the lowest value of its range;
@@ -122,7 +123,7 @@ pub fn wants_entropy() -> bool {
     JITTER_ON.load(Ordering::Relaxed) && enabled()
 }
 
-/// Fold outside entropy (the virtio-rng device's bytes) into the generator. Returns false, and does nothing, in the
+/// Fold outside entropy (the entropy driver's bytes, `ADD_ENTROPY`) into the generator. Returns false, and does nothing, in the
 /// modes where every layout is meant to follow from the seed alone.
 pub fn add_entropy(data: &[u8]) -> bool {
     if !wants_entropy() {

@@ -38,8 +38,6 @@ pub struct Exposed {
 pub enum Bind {
     /// Place the BARs and enable the function, then make the objects the driver needs. A function with no usable register BAR or interrupt is skipped.
     Expose { setup: fn(&pci::Func, &Exposed) },
-    /// The kernel itself uses the device (no driver task): the function gets the bus window cursor.
-    Kernel(fn(&pci::Func, &mut usize)),
 }
 
 /// When in the boot order a task starts. Task ids follow the order tasks are made in, and other tasks know their peers by id, so the order is part of the
@@ -54,6 +52,8 @@ pub enum Phase {
     Console,
     /// The network driver and `netd`, last, so that the tasks before keep their ids.
     Network,
+    /// The entropy driver: after the network tasks, the board's extra tasks and the tty consoles (see `main.rs`).
+    Entropy,
 }
 
 /// A task that exists because a device does: `count` copies of `role`, started in `phase` (and only if `requires`, a device it needs besides its own, is present too).
@@ -237,11 +237,16 @@ pub static DRIVERS: [Driver; 7] = [
         name: "virtio-rng",
         class: DevClass::Entropy,
         pci: (pci::VIRTIO_VENDOR, pci::VIRTIO_RNG_MODERN),
-        role: 0,
-        bind: Bind::Kernel(crate::virtio_rng::collect),
-        grants: &[],
-        dma: &[],
-        tasks: &[],
+        role: 21,
+        bind: Bind::Expose { setup: setup_rng },
+        grants: &[
+        cap(1, Kind::Memory, OBJ_RNG_MMIO, DEV),
+        cap(2, Kind::Memory, OBJ_RNG_DMA, DEV),
+        cap(3, Kind::Memory, OBJ_RNG_PCICFG, R_MAP),
+    ],
+        dma: &[OBJ_RNG_DMA],
+        // (spawned after everything else, the tty consoles included: it takes the last task id and every other task keeps its own)
+        tasks: &[task(21, "rng-driver", SchedClass::Background, true, 1, Phase::Entropy, None)],
         missing_note: Some("[dev] no virtio-rng device found"),
     },
 ];
@@ -264,7 +269,7 @@ pub fn present(class: DevClass) -> bool {
         DevClass::Pointer => OBJ_PTR_MMIO,
         DevClass::Usb => OBJ_USB_MMIO,
         DevClass::Net => OBJ_NET_MMIO,
-        DevClass::Entropy => return false,
+        DevClass::Entropy => OBJ_RNG_MMIO,
     };
     crate::obj::get(mmio).is_some()
 }
@@ -377,10 +382,6 @@ pub(crate) fn probe_pci() {
                 SIDS[i].store(d.sid, Ordering::Relaxed);
                 setup(&f, &d);
             }
-            Bind::Kernel(run) => {
-                CLAIMED[i].store(true, Ordering::Relaxed);
-                run(&f, &mut cursor);
-            }
         }
     }
     for (i, d) in DRIVERS.iter().enumerate() {
@@ -440,6 +441,14 @@ fn setup_usb(f: &pci::Func, d: &Exposed) {
     set(OBJ_USB_PCICFG, ObjKind::Ram, d.cfg_pa, 1, 0);
     set(OBJ_USB_DMA, ObjKind::Dma, mem::alloc_contig(USB_DMA_PAGES, mem::OWNER_KERNEL).expect("usb memory"), USB_DMA_PAGES, 0);
     irq::register(IRQ_USB as usize, d.irq_id); // (the controller's INTx line: the driver may wait for it; it is held off until it does)
+}
+
+fn setup_rng(f: &pci::Func, d: &Exposed) {
+    pci::disable_intx(f);
+    set(OBJ_RNG_MMIO, ObjKind::Mmio, d.bar_pa, d.bar_pages, 0);
+    set(OBJ_RNG_PCICFG, ObjKind::Ram, d.cfg_pa, 1, 0);
+    set(OBJ_RNG_DMA, ObjKind::Dma, mem::alloc(mem::OWNER_KERNEL).expect("rng page"), 1, 0);
+    // no interrupt is registered: the driver polls its used ring
 }
 
 fn setup_net(_f: &pci::Func, d: &Exposed) {

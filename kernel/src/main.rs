@@ -33,7 +33,6 @@ mod thread;
 mod timer;
 mod trap;
 mod uart;
-mod virtio_rng;
 
 use core::panic::PanicInfo;
 use metallium_sched::Class;
@@ -248,6 +247,9 @@ extern "C" fn kmain(dtb: usize) -> ! {
             task::spawn(22, "tty-console", Class::Interactive, false);
         }
     }
+
+    // the entropy driver (a virtio-rng device, if there is one) takes the very last task id
+    devices::spawn_tasks(devices::Phase::Entropy);
 
     kprintln!("[kernel] capability nodes in use: {} of {}", cap::nodes_in_use(), cap::NODES);
     kprintln!("[kernel] entering userspace");

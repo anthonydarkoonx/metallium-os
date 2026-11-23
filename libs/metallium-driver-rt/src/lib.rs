@@ -42,6 +42,7 @@ pub const GETRANDOM: u64 = 43;
 pub const DEVICE_SECRET: u64 = 46;
 pub const IPC_DEFER: u64 = 47;
 pub const IPC_REPLY_TO: u64 = 48;
+pub const ADD_ENTROPY: u64 = 49;
 /// Sleep for a number of microseconds, not rounded up to the scheduler tick.
 pub const SLEEP_US: u64 = 44;
 /// Set the wall clock to a Unix time in nanoseconds; only netd may.
@@ -213,6 +214,12 @@ pub fn defer() -> Option<u64> {
 /// Answer a parked caller; false if it is gone.
 pub fn reply_to(token: u64, w: [u64; 3]) -> bool {
     svc(IPC_REPLY_TO, token, w[0], w[1], w[2], 0)[0] as i64 == 0
+}
+/// Hand the kernel 32 bytes from an entropy device (`ADD_ENTROPY`; only the entropy driver, role 21, may). 0 when they were folded in, `E_NOSYS` when the generator takes no
+/// outside entropy (the layout debugging modes), `E_PERM` for any other caller.
+pub fn add_entropy(bytes: &[u8; 32]) -> i64 {
+    let w = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    svc(ADD_ENTROPY, w(0), w(1), w(2), w(3), 0)[0] as i64
 }
 /// Like `irq_wait`, but gives up after `ticks` (returns E_TIMEDOUT): the driver's watchdog on a silent device.
 pub fn irq_wait_timeout(slot: u64, ticks: u64) -> i64 {

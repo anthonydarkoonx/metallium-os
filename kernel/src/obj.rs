@@ -89,7 +89,9 @@ pub const OBJ_SHM_NET_REGION: u16 = 40;
 pub const OBJ_PTR_MMIO: u16 = 48;
 pub const OBJ_PTR_PCICFG: u16 = 49;
 pub const OBJ_PTR_QUEUE: u16 = 50;
-/// The page the kernel's own virtio-rng exchange uses (ring and buffer); only exists while the device is being read.
+/// The entropy device (virtio-rng, driven by the entropy driver, role 21): registers, config copy, and the one page holding its queue and buffer.
+pub const OBJ_RNG_MMIO: u16 = 37;
+pub const OBJ_RNG_PCICFG: u16 = 38;
 pub const OBJ_RNG_DMA: u16 = 51;
 /// 64 receive and 32 transmit buffers of 2 KiB.
 pub const NET_BUF_PAGES: usize = 48;
@@ -127,15 +129,6 @@ pub(crate) fn set(i: u16, kind: ObjKind, pa: usize, pages: usize, aux: usize) {
     // (a DMA buffer must lie where the device can address it: platforms whose devices use 32-bit addresses set `DMA_LIMIT`; the allocator hands unmovable frames out from the bottom of RAM)
     assert!(kind != ObjKind::Dma || pa.saturating_add(pages * mem::PAGE) <= crate::platform::DMA_LIMIT, "a DMA object lies above the platform's DMA limit");
     OBJS.lock(R_OBJ)[i as usize] = MemObj { kind, pa, pages, aux, root: 0, list: 0, owner: NO_OWNER };
-}
-
-/// The page the kernel reads the virtio-rng device through (see `virtio_rng.rs`).
-pub fn set_rng_dma(pa: usize) {
-    set(OBJ_RNG_DMA, ObjKind::Dma, pa, 1, 0);
-}
-
-pub fn clear_rng_dma() {
-    OBJS.lock(R_OBJ)[OBJ_RNG_DMA as usize].kind = ObjKind::Unused;
 }
 
 pub fn init() {

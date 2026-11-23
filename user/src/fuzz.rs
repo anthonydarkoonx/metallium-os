@@ -289,7 +289,7 @@ pub fn conduct() {
     );
     let (nodes1, dyn1) = (sysinfo(1)[5], sysinfo(4)[2]);
     println!("[client] TEST capability nodes and dynamic memory objects are all back (nodes {nodes0} -> {nodes1}, objects {dyn0} -> {dyn1}): {}", verdict(nodes1 <= nodes0 && dyn1 <= dyn0));
-    let programs = (27..64u64).filter(|&t| sysinfo_at(3, t)[3] != 0).count();
+    let programs = (28..64u64).filter(|&t| sysinfo_at(3, t)[3] != 0).count();
     println!("[client] TEST every program the fuzzer started is gone with it (live program slots: {programs}): {}", verdict(programs == 0));
     let alive = sysinfo_at(3, 0)[3] != 7;
     println!("[client] TEST the conductor itself survived: {}", verdict(alive));

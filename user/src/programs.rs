@@ -16,7 +16,7 @@ const TASK_START: u64 = 29;
 /// pass on.
 const SPAWN_SLOT: u64 = 26;
 const DRIVER_SLOT: u64 = 27;
-const FIRST_DYNAMIC: u64 = 27;
+const FIRST_DYNAMIC: u64 = 28;
 const EP_CREATE: u64 = 27;
 const CAP_REVOKE: u64 = 6;
 const FACTORY_SLOT: u64 = 12;

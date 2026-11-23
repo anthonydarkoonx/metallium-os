@@ -97,6 +97,10 @@ pub const DEVICE_SECRET: u64 = 46;
 pub const IPC_DEFER: u64 = 47;
 /// IPC_REPLY_TO(token, w0, w1, w2): answer a caller parked by `IPC_DEFER`; `E_NOREPLY` if it is gone or was not parked by this task.
 pub const IPC_REPLY_TO: u64 = 48;
+/// ADD_ENTROPY(w0, w1, w2, w3): fold 32 bytes (four little-endian words) from an entropy device into the kernel's generator (`rand.rs`). Only the entropy driver
+/// (role 21, the virtio-rng driver) may (`E_PERM`); `E_NOSYS` when the generator takes no outside entropy (the layout debugging modes: every layout is meant to follow from
+/// the seed alone). Bytes that arrive make the generator strong enough for `GETRANDOM` even on a CPU without RNDR and with no seed file. A driver may call it again to reseed.
+pub const ADD_ENTROPY: u64 = 49;
 pub const SC_RT_SET: u64 = 1;
 pub const SC_RT_WAIT: u64 = 2;
 pub const SC_RT_CLEAR: u64 = 3;
@@ -215,6 +219,20 @@ fn run(cur: usize) -> (u64, Out) {
             let wake_at = timer::counter().saturating_add(timer::us_to_counter(a1.min(1_000_000))).min(1 << 55);
             sched::set_state(cur, State::Sleep(wake_at));
             Out::Block
+        }
+        ADD_ENTROPY => {
+            const ENTROPY_ROLE: u8 = 21;
+            if task::info(cur).role != ENTROPY_ROLE {
+                Out::Ret(E_PERM)
+            } else {
+                let mut b = [0u8; 32];
+                for (i, w) in [a1, a2, a3, a4].iter().enumerate() {
+                    b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+                }
+                let taken = crate::rand::add_entropy(&b);
+                b.fill(0);
+                Out::Ret(if taken { 0 } else { E_NOSYS })
+            }
         }
         SETTIME => {
             const NETD_ROLE: u8 = 19;

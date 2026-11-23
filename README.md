@@ -33,6 +33,7 @@ ported from Linux and U-Boot, is a separate GPL-2.0-only repository: [metallium-
 | `libs/metallium-gfx` | 2D drawing primitives and the bitmap/outline typefaces; the terminal draws its text with it. The OS ships no window system: it is meant to run one (a window manager or desktop environment) as ordinary user programs; see `docs/DESKTOP-INTERFACE.md` |
 | `libs/metallium-input` | device-neutral input events: pointer (mouse/touch/pen) and key events in 24.8 fixed point, the translator for the drivers' packed words, the gesture recogniser (tap, context menu, pan, fling, pinch). Host-tested, for a window system to use |
 | `libs/metallium-fdt` | flattened device tree reader (RAM, cores and their speeds, GIC, PSCI conduit); host-tested on real QEMU trees and damaged copies |
+| *entropy driver (separate repository)* | [metallium-entropy-userspace](https://github.com/anthonydarkoonx/metallium-entropy-userspace): the virtio-rng driver (role 21), which feeds the kernel's generator with `ADD_ENTROPY` |
 | *networking (separate repository)* | [metallium-networking-userspace](https://github.com/anthonydarkoonx/metallium-networking-userspace): the IP stack (`metallium-net`), the network service `netd`, the virtio-net driver `netdrv`, the HTTP client, the client API and test programs, and the host peer; see its `README.md` |
 | `libs/metallium-usb` | USB input without hardware: HID descriptor and report parsing, key tables; host-tested |
 | `libs/metallium-ed25519` | SHA-512 and Ed25519 signature verification (RFC 8032), no heap |

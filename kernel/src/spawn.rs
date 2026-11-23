@@ -320,7 +320,7 @@ static NO_FIXED_MAPS: crate::table::Table<core::sync::atomic::AtomicBool> = crat
 
 /// The boot-time services (not the test programs) may not name addresses for `MEM_MAP` either.
 pub fn restrict_boot_task(tid: usize, role: u8) {
-    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20 | 22) {
+    if matches!(role, 2 | 4 | 5 | 6 | 7 | 9 | 12 | 13 | 14 | 18 | 19 | 20 | 21 | 22) {
         NO_FIXED_MAPS[tid].store(true, Ordering::SeqCst);
     } else {
         NO_FIXED_MAPS[tid].store(false, Ordering::SeqCst);

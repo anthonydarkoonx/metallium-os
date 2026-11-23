@@ -55,7 +55,7 @@ impl Ability for Probe {
             code |= 128;
         }
         // confining programs is the parent's right: not mine, whoever the target is (none of these is a program I started)
-        if [0u64, 1, 8, 27, 28, 29, 30, 31, 32].iter().all(|&t| fs::scope(t, "/data").is_err()) {
+        if [0u64, 1, 8, 27, 28, 29, 30, 31, 32, 33].iter().all(|&t| fs::scope(t, "/data").is_err()) {
             code |= 256;
         }
         save(code, 0xFEED);

@@ -12,6 +12,8 @@ metallium-lfs = { path = "../libs/metallium-lfs" }
 metallium-crypt = { path = "../libs/metallium-crypt" }
 metallium-loader = { path = "../libs/metallium-loader" }
 # the network service, its driver and the HTTP client: the networking repository, checked out next to this one
+# the entropy driver (virtio-rng): its own repository, checked out next to this one
+metallium-entropy = { path = "../../metallium-entropy-userspace" }
 metallium-net-services = { path = "../../metallium-networking-userspace/services" }
 metallium-gfx = { path = "../libs/metallium-gfx" }
 metallium-input = { path = "../libs/metallium-input" }

@@ -40,7 +40,7 @@ pub fn limit() -> usize {
     LIMIT.load(Ordering::Relaxed)
 }
 /// First slot that may hold a task created at run time.
-pub const FIRST_DYNAMIC_TASK: usize = 27;
+pub const FIRST_DYNAMIC_TASK: usize = 28;
 pub const USER_BASE: usize = 0x8000_0000;
 /// Code and data of a program lie between `USER_BASE` and here (the loader's limit; the old stack position is kept out).
 pub const IMAGE_END: usize = 0x800F_0000;
