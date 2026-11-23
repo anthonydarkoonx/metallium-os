@@ -47,7 +47,7 @@ mod termedit;
 mod compaction;
 pub use metallium_driver_rt::{dma, proto, virtio};
 // the network service, its driver and the HTTP client live in the networking repository (see its README.md)
-pub use metallium_net_services::{httpc, netd, netdrv};
+pub use metallium_net_services::{httpc, netd, netdrv, netring};
 mod heap;
 mod ring;
 mod sched;
