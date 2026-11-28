@@ -12,7 +12,7 @@ or the endpoint ended, `-5` invalid argument, `-6` no reply owed, `-7` no such c
 `-10` try again (non-blocking call would block).
 
 ## Floating point
-User programs must not use floating-point or SIMD registers: `CPACR_EL1` traps them at EL0 and the program is ended (the registers are not saved between tasks). Build programs for a soft-float target (`aarch64-unknown-none-softfloat`). `TPIDR_EL0` is per task and starts at 0.
+User programs may use floating point and SIMD (`q0`-`q31`, `FPCR`, `FPSR`). Access starts off (`CPACR_EL1.FPEN` traps EL0); a task's first FP/SIMD instruction traps into the kernel (`kernel/src/fpu.rs`), which gives it a zeroed register file, turns access on for it and runs the instruction again. From then on the registers are saved and restored whenever the task is switched out and in (eagerly, so a task may move between cores), and a task that never uses FP costs nothing. Each thread has its own registers. The kernel itself is soft-float and never touches them. Programs of this tree are built for the soft-float target (`aarch64-unknown-none-softfloat`), which keeps their code free of FP; hard-float code (C and C++ ports, `aarch64-unknown-none`) also runs. `TPIDR_EL0` is per task and starts at 0.
 
 ## Capabilities
 Every right to do anything is a capability in one of 32 slots of the task's table (slot 15 is the console). A capability

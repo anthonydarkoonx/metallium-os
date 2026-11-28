@@ -142,7 +142,7 @@ kernel: user
 # Programs started with SPAWN (programs/): position-independent ELF files in programs/build (random image base each run; the
 # loader relocates them), packed into the system image under /bin. `sleeper` stays a flat image (the user crate embeds
 # it); the static `.elf` copies of argdump and hello exist to test the loader's fixed-address path.
-PROGRAM_BINS := racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
+PROGRAM_BINS := fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
 PIE_FLAGS := -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro --cfg getrandom_backend=\"custom\"
 programs:
 	rm -rf programs/build; mkdir -p programs/build
@@ -576,16 +576,20 @@ qemu-test-encrypted: kernel disk
 	@head -c 32 /dev/urandom > build-device-secret.bin
 	@$(MAKE) --no-print-directory qemu-test QEMU_EXTRA='-fw_cfg name=opt/metallium/device-secret,file=build-device-secret.bin' 2>&1 | tee build-encrypted.log | grep -E "encrypted|INTEGRATION" ; grep -q "ALL PASS" build-encrypted.log && grep -q "made an encrypted volume" build-encrypted.log; rc=$$?; rm -f build-device-secret.bin; exit $$rc
 
+# (These three start from a freshly made disk: an earlier suite of the same `make test`, e.g. qemu-test-encrypted, leaves an encrypted volume on it.)
 # The directory table of /data: an older-layout table is read, hundreds of entries, long paths (see tools/table-test.py)
 table-test: kernel disk
+	@python3 tools/mkdisk.py $(DISK) >/dev/null
 	@python3 tools/table-test.py '$(QEMU)'
 
 # Sessions: accounts, logins, homes confined per user (tools/session-test.py)
 session-test: kernel disk
+	@python3 tools/mkdisk.py $(DISK) >/dev/null
 	@python3 tools/session-test.py '$(QEMU)'
 
 # The same with the machine volume encrypted too (the users' domains on top of the volume's own layer)
 session-test-encrypted: kernel disk
+	@python3 tools/mkdisk.py $(DISK) >/dev/null
 	@head -c 32 /dev/urandom > build-device-secret.bin
 	@python3 tools/session-test.py '$(QEMU) -fw_cfg name=opt/metallium/device-secret,file=build-device-secret.bin' encrypted; rc=$$?; rm -f build-device-secret.bin; exit $$rc
 

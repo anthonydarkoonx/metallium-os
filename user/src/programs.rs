@@ -624,6 +624,18 @@ pub fn tests() {
     println!("[client] TEST a collected program's slot is free again (state {}): {}", state_of(t), verdict(state_of(t) == 0));
     println!("[client] TEST waiting twice for the same program is refused ({}): {}", wait(t, false), verdict(wait(t, false) == E_INVAL as i64));
 
+    // ---- floating point and SIMD ----------------------------------------------------------------------------------
+    // Programs are built soft-float, but they may use FP/SIMD in assembly (or be built hard-float, as C++ ports are): the first use traps, the
+    // kernel gives the task a zeroed register file, and it is saved and restored at every switch (kernel/src/fpu.rs). Eight copies run at once
+    // with different patterns in q0-q31 and FPCR, yielding, sleeping and being preempted (on every core); each checks its registers all
+    // the way and that its first look at them showed zero, whatever a program that ran before had left there.
+    let fptest = load("fptest");
+    if fptest.len() >= 32 {
+        let ts: Vec<i64> = (0..8u64).map(|i| Req::new().arg((i + 1) | 1 << 32).heap(4).go(&fptest)).collect();
+        let codes: Vec<i64> = ts.iter().map(|&t| if t > 0 { wait(t, false) } else { -1 }).collect();
+        println!("[client] TEST eight programs keep their own FP/SIMD registers and FPCR across yields, sleeps and preemption, and see zeroes at first use (exit codes {codes:?}): {}", verdict(ts.iter().all(|&t| t > 0) && codes.iter().all(|&c| c == 0)));
+    }
+
     // ---- faults --------------------------------------------------------------------------------------------------
     let t = Req::new().arg(0).go(&crash);
     let code = if t > 0 { wait(t, false) as u64 } else { 0 };
@@ -801,11 +813,11 @@ pub fn tests() {
             wait(sib, false);
         }
         println!("[client] TEST a program cannot put capabilities into a boot-time task or an unrelated program, but can into its parent (bits of refusals that failed: {m2:#x}): {}", verdict(m2 == 0));
-        // M4: user programs cannot use FP/SIMD (the registers are not switched between tasks), and TPIDR_EL0 is per task
+        // M4: a first FP/SIMD instruction is allowed (the kernel switches the registers per task; see the fptest test), and TPIDR_EL0 is per task
         let (c10, o10, _) = run_with_console3(Req::new().arg(10).heap(32), &race, b"");
         let o10 = String::from_utf8_lossy(&o10).into_owned();
         let (c11, _, _) = run_with_console3(Req::new().arg(11).heap(64).threads(1), &race, b"");
-        println!("[client] TEST a SIMD instruction in a user program ends it ({c10:#x}, survived {}), and TPIDR_EL0 is not shared between tasks (bits {c11:#x}): {}", o10.contains("survived"), verdict(c10 as u64 == EXIT_FAULTED && !o10.contains("survived") && c11 == 0));
+        println!("[client] TEST a SIMD instruction in a user program runs ({c10:#x}, survived {}), and TPIDR_EL0 is not shared between tasks (bits {c11:#x}): {}", o10.contains("survived"), verdict(c10 == 0 && o10.contains("survived") && c11 == 0));
         // M7: a program's share of the global tables (memory objects, capability nodes, endpoints) is limited, however many threads it has
         let q12 = run_with_console3(Req::new().arg(12).heap(400).threads(7), &race, b"").0;
         let q13 = run_with_console3(Req::new().arg(13).heap(400).threads(7), &race, b"").0;

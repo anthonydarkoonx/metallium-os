@@ -47,7 +47,7 @@ fn ec_name(ec: u64) -> &'static str {
         0x24 | 0x25 => "data abort",
         0x26 => "SP alignment fault",
         0x00 => "undefined/unknown",
-        0x07 => "floating-point or SIMD instruction (not allowed in user programs: build them soft-float)",
+        0x07 => "floating-point or SIMD instruction in the kernel (the kernel is built soft-float)",
         0x0e => "illegal execution state",
         _ => "synchronous exception",
     }
@@ -65,6 +65,9 @@ extern "C" fn lower_sync(tf: &mut TrapFrame) {
     let swap_fault = if ec == 0x15 { swap::Fault::Other } else { swap::handle_fault(cur, ec, esr, far() as usize) };
     let preempt = if ec == 0x15 {
         syscall::handle(cur)
+    } else if ec == 0x07 {
+        crate::fpu::first_use(cur); // the task's first FP/SIMD instruction: give it a clear register file and run it again
+        false
     } else if let swap::Fault::Retry = swap_fault {
         false // a swapped-out page is back, or an aged one was marked used: run the instruction again
     } else if let swap::Fault::Sleep = swap_fault {

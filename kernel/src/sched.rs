@@ -790,6 +790,7 @@ pub fn forget_task(tid: usize) {
     **TASK_UTIL.write(tid) = Util::new(WINDOW.load(Ordering::Relaxed));
     SLOT[tid].slice_end.store(u64::MAX, Ordering::Relaxed);
     SLOT[tid].run_start.store(0, Ordering::Relaxed);
+    crate::fpu::reset(tid); // (and starts with floating point off)
     TPIDR[tid].store(0, Ordering::Relaxed); // (a new task, or a restarted one, starts with a clear thread pointer)
 }
 
@@ -1594,6 +1595,7 @@ pub fn dispatch(tf: &mut TrapFrame, preempt: bool) {
     set_flag(&STATS[core].preempt_pending, false);
     if cur != usize::MAX {
         tpidr_save(cur); // (the register still holds the interrupted task's value)
+        crate::fpu::save(cur); // (so do the FP/SIMD registers, if it used them)
     }
     let mut now = sample_clock(core, preempt);
     if cur != usize::MAX {
@@ -1645,6 +1647,7 @@ pub fn dispatch(tf: &mut TrapFrame, preempt: bool) {
                 CURRENT[core].store(next, Ordering::Relaxed);
                 mmu::switch_to(task::l1_of(next), next as u16 + 1);
                 tpidr_load(next);
+                crate::fpu::load(next);
                 *tf = *frame(next);
                 let slice = SLOT[next].slice_end.load(Ordering::Relaxed);
                 let mut ev = rt_event(core, next, now);
@@ -1778,6 +1781,7 @@ pub fn init_tables(n: usize) {
     DOOM_WHY.init(n, |_| const { AtomicU8::new(0) });
     IRQ_DEADLINE.init(n, |_| const { AtomicU64::new(0) });
     TPIDR.init(n, |_| const { AtomicU64::new(0) });
+    crate::fpu::init_tables(n);
     RECV_EPS.init(n, |_| const { [const { AtomicU16::new(NO_EP) }; 2] });
     RT_CORE.init(n, |_| const { AtomicU8::new(NO_CORE) });
     RT_DEADLINE.init(n, |_| const { AtomicU64::new(u64::MAX) });

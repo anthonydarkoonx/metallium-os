@@ -30,8 +30,8 @@ use metallium_programs::*;
 //      sibling not refused, 8 parent refused.
 //   9  L1: SYSINFO pages 10, 11, 13 and 14 (what other tasks hold) need an Admin capability, which this program has not: each must
 //      answer -1, while page 0 works. Exit code: one bit per page that was not refused (1, 2, 4, 8), 16 if page 0 failed.
-//   10 M4: a floating-point / SIMD instruction in a user program traps and ends it (the registers are not switched between tasks, so
-//      they must not be usable). Prints "survived" if it ran; the program is expected to fault.
+//   10 M4: a floating-point / SIMD instruction in a user program runs (the first use traps into the kernel, which gives the task a clear
+//      register file and switches it from then on: kernel/src/fpu.rs; `fptest` checks the isolation). Prints "survived" when it ran.
 //   11 M4: TPIDR_EL0 belongs to the task: this one sets A, a thread sets B and gives up the CPU many times, and a new thread starts
 //      with 0. Exit code bits: 1 the thread did not start with 0, 2 the thread lost its own value, 4 this task's value was changed.
 //   12 M7: one program's run-time memory objects (SHM_CREATE) are limited, however many threads make them: seven threads and this one
@@ -883,7 +883,7 @@ program!("racetest", |c| {
         }
         7 => m2(c.arg >> 8, c.parent),
         10 => {
-            // SAFETY: `.inst` emits `movi v0.16b, #0`, which touches only a vector register; the kernel is expected to refuse it.
+            // SAFETY: `.inst` emits `movi v0.16b, #0`, which touches only a vector register that is this task's own.
             unsafe { core::arch::asm!(".inst 0x4f000400", out("v0") _) };
             println!("racetest: survived a SIMD instruction");
             0

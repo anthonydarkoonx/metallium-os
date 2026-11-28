@@ -3,6 +3,7 @@
 #![no_main]
 
 mod cache;
+mod fpu;
 mod frame;
 mod cap;
 mod compact;
