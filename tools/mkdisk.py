@@ -3,11 +3,13 @@
 
   sector 0            magic string
   sectors 100..107    scratch (raw block-driver test writes here)
-  sectors 1024..13311 system partition: read-only EROFS image (6 MiB)
+  sectors 1024..13311 system partition: read-only EROFS image (6 MiB; SYSTEM_MIB=n makes it larger, see below)
   sectors 13312..24575 data partition: log-structured store (formatted by its server)
-(Layout 4: the system partition grew from 4 to 6 MiB for the JavaScript engine (Kataan, about 1.3 MB compressed), and the disk from 10 to 12 MiB so the data
+(Layout 5: the size of the system partition is in the header (bytes 48..56 of sector 0, little endian, in sectors) and the data partition starts right after it, so
+a disk for a desktop can have a system partition of hundreds of MiB: SYSTEM_MIB=512 python3 tools/mkdisk.py disk.img. The default stays 6 MiB, so the test disks are
+the same as with layout 4. Layout 4: the system partition grew from 4 to 6 MiB for the JavaScript engine (Kataan, about 1.3 MB compressed), and the disk from 10 to 12 MiB so the data
 partition kept its size. Layout 3: the system partition grew from 2 to 4 MiB when TLS and the root certificates outgrew it, and the disk from 8 to 10 MiB so the
-data partition kept its size. Layout 2 had grown it from 1.5 to 2 MiB. Byte 40 of sector 0 says "layout=4"; an older disk is not kept.)
+data partition kept its size. Layout 2 had grown it from 1.5 to 2 MiB. Byte 40 of sector 0 says "layout=5"; an older disk is not kept.)
 """
 import os
 import sys
@@ -15,9 +17,12 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 import mkerofs
 
-ROFS_BASE, ROFS_SECTORS = 1024, 12288
-DATA_BASE = 13312  # the data partition starts right after the system partition
-LAYOUT = b"layout=4"
+ROFS_BASE = 1024
+SYSTEM_MIB = float(os.environ.get("SYSTEM_MIB", "6"))
+ROFS_SECTORS = int(SYSTEM_MIB * 2048) // 8 * 8
+assert ROFS_SECTORS >= 2048, "the system partition must be at least 1 MiB"
+DATA_BASE = ROFS_BASE + ROFS_SECTORS  # the data partition starts right after the system partition (13312 for the default 6 MiB: tools/volume-test.py and checkdisk.py assume it)
+LAYOUT = b"layout=5"
 # The data partition is the rest of the disk, and the guest uses all of it (the storage server asks the block driver how big the disk is). The test
 # disks keep the small default (5.5 MiB: the cleaner test of the QEMU suite writes far past the end of it); a disk for real use asks for more, and the
 # file is sparse, so 32 GiB costs nothing until it is written: DATA_MIB=32768 python3 tools/mkdisk.py disk.img
@@ -29,6 +34,7 @@ SECTORS = DATA_BASE + DATA_SECTORS
 d = bytearray(DATA_BASE * 512)  # (everything before the data partition; the data partition itself is left to the guest to format)
 d[0:64] = b"METAL-OS-DISK v1 sector 0".ljust(64, b".")
 d[40:40 + len(LAYOUT)] = LAYOUT
+d[48:56] = ROFS_SECTORS.to_bytes(8, "little")
 import shutil
 import subprocess
 import tempfile

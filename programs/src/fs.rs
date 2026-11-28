@@ -19,6 +19,11 @@ const V_WRITE: u64 = 52;
 const V_CLOSE: u64 = 54;
 const V_STAT: u64 = 55;
 const V_LIST: u64 = 56;
+const V_LIST_AT: u64 = 65;
+const V_STAT_TIME: u64 = 68;
+const V_LOCK: u64 = 69;
+const V_LSTAT: u64 = 66;
+const V_READLINK: u64 = 67;
 const V_UNLINK: u64 = 57;
 const V_MKDIR: u64 = 58;
 const V_SYNC: u64 = 59;
@@ -89,9 +94,34 @@ impl Fs {
         self.with(|s| s.stat(path))
     }
 
+    /// See `Session::flock`.
+    pub fn flock(&self, fd: u64, op: u64) -> Result<(), Error> {
+        self.with(|s| s.flock(fd, op))
+    }
+
+    /// See `Session::lstat`.
+    pub fn lstat(&self, path: &str) -> Result<(u64, u64), Error> {
+        self.with(|s| s.lstat(path))
+    }
+
+    /// See `Session::stat_time`.
+    pub fn stat_time(&self, path: &str, nofollow: bool) -> Result<(u64, u64, u64), Error> {
+        self.with(|s| s.stat_time(path, nofollow))
+    }
+
+    /// See `Session::readlink`.
+    pub fn readlink(&self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
+        self.with(|s| s.readlink(path, buf))
+    }
+
     /// The names in a directory, '\n'-separated, into `buf`; the number of bytes.
     pub fn list(&self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
         self.with(|s| s.list(path, buf))
+    }
+
+    /// See `Session::list_at`.
+    pub fn list_at(&self, path: &str, cursor: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        self.with(|s| s.list_at(path, cursor, buf))
     }
 
     pub fn unlink(&self, path: &str) -> Result<(), Error> {
@@ -205,12 +235,44 @@ impl Sess {
         self.with_path(path, V_STAT, 0)
     }
 
+    /// An advisory lock on the open file `fd`: `op` 1 shared, 2 exclusive, 3 unlock; status 12 when someone else holds a conflicting one.
+    fn flock(&self, fd: u64, op: u64) -> Result<(), Error> {
+        self.rpc(V_LOCK, fd, op).map(|_| ())
+    }
+
+    /// `stat` without following a symbolic link in the last component: kind 3 = a link, its size the length of its target.
+    fn lstat(&self, path: &str) -> Result<(u64, u64), Error> {
+        self.with_path(path, V_LSTAT, 0)
+    }
+
+    /// (size, kind, modification time in seconds since 1970 or 0) of a path, optionally not following a symbolic link in its last component.
+    fn stat_time(&self, path: &str, nofollow: bool) -> Result<(u64, u64, u64), Error> {
+        let (size, kt) = self.with_path(path, V_STAT_TIME, nofollow as u64)?;
+        Ok((size, kt & 0xFF, kt >> 8))
+    }
+
+    /// The target of a symbolic link, into `buf`: the number of bytes.
+    fn readlink(&self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
+        let (n, _) = self.with_path(path, V_READLINK, 0)?;
+        let n = (n as usize).min(buf.len()).min(MAXIO);
+        self.get(DATA, &mut buf[..n]);
+        Ok(n)
+    }
+
     /// The names in a directory, '\n'-separated, into `buf`; the number of bytes.
     fn list(&self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
         let (n, _) = self.with_path(path, V_LIST, 0)?;
         let n = (n as usize).min(buf.len()).min(MAXIO);
         self.get(DATA, &mut buf[..n]);
         Ok(n)
+    }
+
+    /// The next piece of a directory's names after the first `cursor` (whole names, '\n'-separated), into `buf`: the number of bytes and whether there are more.
+    fn list_at(&self, path: &str, cursor: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        let (n, more) = self.with_path(path, V_LIST_AT, cursor)?;
+        let n = (n as usize).min(buf.len()).min(MAXIO);
+        self.get(DATA, &mut buf[..n]);
+        Ok((n, more != 0))
     }
 
     fn unlink(&self, path: &str) -> Result<(), Error> {
@@ -340,7 +402,24 @@ pub enum SeekFrom {
     Current(i64),
 }
 
+/// The state of an advisory lock request that did not wait: someone else holds a conflicting lock on the file.
+pub const EAGAIN: i64 = 12;
+
 impl File {
+    /// An advisory lock on this file (like `flock` with `LOCK_NB`): shared, or exclusive. It never waits: `ErrorKind::WouldBlock` if another open file holds a
+    /// conflicting lock (retry later, as a blocking lock does by polling). Asking again converts the lock. It is released by `unlock`, when the file is closed or
+    /// when the program ends.
+    pub fn try_lock(&self, exclusive: bool) -> io::Result<()> {
+        match session(|fs| fs.flock(self.fd, if exclusive { 2 } else { 1 })) {
+            Err(e) if e.code == EAGAIN => Err(io::Error { kind: ErrorKind::WouldBlock, code: EAGAIN }),
+            r => r,
+        }
+    }
+
+    pub fn unlock(&self) -> io::Result<()> {
+        session(|fs| fs.flock(self.fd, 3))
+    }
+
     pub fn open(path: &str) -> io::Result<File> {
         OpenOptions::new().read(true).open(path)
     }
@@ -402,17 +481,38 @@ impl io::Write for File {
 pub struct Metadata {
     pub len: u64,
     pub is_dir: bool,
+    /// A symbolic link (only from `symlink_metadata`: `metadata` follows links); `len` is then the length of its target.
+    pub is_symlink: bool,
+    /// When it was last changed, in seconds since 1970; 0 if not known (files of the system image have none, and neither has a machine without a clock).
+    pub modified: u64,
 }
 
 impl Metadata {
     pub fn is_file(&self) -> bool {
-        !self.is_dir
+        !self.is_dir && !self.is_symlink
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.is_symlink
     }
 }
 
+/// Information about a path, following symbolic links.
 pub fn metadata(path: &str) -> io::Result<Metadata> {
-    let (len, kind) = session(|fs| fs.stat(path))?;
-    Ok(Metadata { len, is_dir: kind == 2 })
+    let (len, kind, modified) = session(|fs| fs.stat_time(path, false))?;
+    Ok(Metadata { len, is_dir: kind == 2, is_symlink: false, modified })
+}
+
+/// Information about a path itself: a symbolic link in its last component is not followed.
+pub fn symlink_metadata(path: &str) -> io::Result<Metadata> {
+    let (len, kind, modified) = session(|fs| fs.stat_time(path, true))?;
+    Ok(Metadata { len, is_dir: kind == 2, is_symlink: kind == 3, modified })
+}
+
+/// The target of a symbolic link (`InvalidInput` if the path is not one).
+pub fn read_link(path: &str) -> io::Result<String> {
+    let mut buf = alloc::vec![0u8; MAXIO];
+    let n = session(|fs| fs.readlink(path, &mut buf))?;
+    String::from_utf8(buf[..n].to_vec()).map_err(|_| io::Error::new(ErrorKind::InvalidData))
 }
 
 pub fn exists(path: &str) -> bool {
@@ -487,15 +587,21 @@ pub struct DirEntry {
 
 /// The entries of a directory (directories are listed with a trailing '/' by the VFS).
 pub fn read_dir(path: &str) -> io::Result<Vec<DirEntry>> {
+    // (a directory is read in pieces of a page, each from where the last ended, so a directory of any size comes out whole)
     let mut buf = alloc::vec![0u8; MAXIO];
-    let n = session(|fs| fs.list(path, &mut buf))?;
-    let text = core::str::from_utf8(&buf[..n]).map_err(|_| io::Error::new(ErrorKind::InvalidData))?;
-    Ok(text
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(|s| match s.strip_suffix('/') {
-            Some(d) => DirEntry { name: String::from(d), is_dir: true },
-            None => DirEntry { name: String::from(s), is_dir: false },
-        })
-        .collect())
+    let (mut out, mut cursor) = (Vec::new(), 0u64);
+    loop {
+        let (n, more) = session(|fs| fs.list_at(path, cursor, &mut buf))?;
+        let text = core::str::from_utf8(&buf[..n]).map_err(|_| io::Error::new(ErrorKind::InvalidData))?;
+        for s in text.split('\n').filter(|s| !s.is_empty()) {
+            cursor += 1;
+            out.push(match s.strip_suffix('/') {
+                Some(d) => DirEntry { name: String::from(d), is_dir: true },
+                None => DirEntry { name: String::from(s), is_dir: false },
+            });
+        }
+        if !more || n == 0 {
+            return Ok(out);
+        }
+    }
 }

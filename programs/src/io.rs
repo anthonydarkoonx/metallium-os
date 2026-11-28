@@ -74,6 +74,7 @@ impl Error {
             7 => ErrorKind::Io,
             8 => ErrorKind::AlreadyExists,
             9 => ErrorKind::NotEmpty,
+            12 => ErrorKind::WouldBlock,
             _ => ErrorKind::Other,
         };
         Error { kind, code }

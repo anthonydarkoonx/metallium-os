@@ -142,7 +142,7 @@ kernel: user
 # Programs started with SPAWN (programs/): position-independent ELF files in programs/build (random image base each run; the
 # loader relocates them), packed into the system image under /bin. `sleeper` stays a flat image (the user crate embeds
 # it); the static `.elf` copies of argdump and hello exist to test the loader's fixed-address path.
-PROGRAM_BINS := captest mmaptest fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
+PROGRAM_BINS := lockprobe waittest captest mmaptest fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
 PIE_FLAGS := -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro --cfg getrandom_backend=\"custom\"
 programs:
 	rm -rf programs/build; mkdir -p programs/build
@@ -291,6 +291,16 @@ qemu-test: kernel disk
 	 grep -q "TEST a caller waiting on an endpoint that ends is told so.*PASS" build.log && \
 	 grep -q "TEST a task can create endpoints until it has no capability slot.*PASS" build.log && \
 	 grep -q "TEST capabilities travel in messages between unrelated programs.*PASS" build.log && \
+	 grep -q "TEST a receive can time out, and a receive on several endpoints.*PASS" build.log && \
+	 grep -q "TEST a /system directory of 420 entries is listed whole in pieces.*PASS" build.log && \
+	 grep -q "TEST a /data directory of 60 long names is listed whole in pieces.*PASS" build.log && \
+	 grep -q "TEST a program lists a directory of 420 entries.*PASS" build.log && \
+	 grep -q "TEST symbolic links on /system are followed.*PASS" build.log && \
+	 grep -q "TEST /data entries have modification times.*PASS" build.log && \
+	 grep -q "TEST a file's modification time is in the table.*PASS" build.log && \
+	 grep -q "TEST advisory locks on open files.*PASS" build.log && \
+	 grep -q "TEST a lock held by one program keeps another out.*PASS" build.log && \
+	 grep -q "TEST a program killed while it waits on several endpoints.*PASS" build.log && \
 	 grep -q "TEST every capability node and frame the capability-passing test used is back.*PASS" build.log && \
 	 grep -q "TEST program packages in the system image install.*PASS" build.log && \
 	 grep -q "TEST a corrupt package, one whose id differs.*PASS" build.log && \
@@ -584,7 +594,7 @@ qemu-test-encrypted: kernel disk
 # (These three start from a freshly made disk: an earlier suite of the same `make test`, e.g. qemu-test-encrypted, leaves an encrypted volume on it.)
 # The directory table of /data: an older-layout table is read, hundreds of entries, long paths (see tools/table-test.py)
 table-test: kernel disk
-	@python3 tools/mkdisk.py $(DISK) >/dev/null
+	@DATA_MIB=32 python3 tools/mkdisk.py $(DISK) >/dev/null # (1500 more files than the 5.5 MiB test partition holds)
 	@python3 tools/table-test.py '$(QEMU)'
 
 # Sessions: accounts, logins, homes confined per user (tools/session-test.py)

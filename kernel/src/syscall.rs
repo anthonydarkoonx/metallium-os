@@ -117,6 +117,12 @@ pub const MUNMAP: u64 = 51;
 /// executable has its instruction cache made coherent first, so code written before the call runs.
 pub const MPROTECT: u64 = 52;
 pub const MAP_FIXED: u64 = 1 << 8;
+/// IPC_WAIT_ANY(slot mask, flags, timeout in microseconds) -> as `IPC_RECV`, from any of several endpoints: bit `i` of the mask names this task's capability slot `i`, which must hold
+/// an endpoint with the receive right (`-2` if one does not; two slots for the same endpoint count once). `flags` as for `IPC_RECV`: bit 0 do not wait (`-10` if nothing is queued), bit 1 take a
+/// capability that comes with the message. The result is `IPC_RECV`'s, and `x5` bits 16..23 hold the slot the message came from plus one. A timeout of 0 waits for ever; otherwise `-9`
+/// (`E_TIMEDOUT`) after that long (at most an hour). `-3` if another task already waits on one of the endpoints (an endpoint has one waiting receiver). The wait ends with `-2` if a receive capability of
+/// the set is revoked, `-4` if an endpoint of it ends.
+pub const IPC_WAIT_ANY: u64 = 53;
 pub const SC_RT_SET: u64 = 1;
 pub const SC_RT_WAIT: u64 = 2;
 pub const SC_RT_CLEAR: u64 = 3;
@@ -180,14 +186,15 @@ fn run(cur: usize) -> (u64, Out) {
     let moves_cap = match id {
         IPC_SEND | IPC_CALL | IPC_REPLY_TO => f.x[5] & CAP_XFER != 0,
         IPC_REPLY => a4 & CAP_XFER != 0,
-        IPC_RECV => a2 & RECV_ACCEPT != 0,
+        IPC_RECV | IPC_WAIT_ANY => a2 & RECV_ACCEPT != 0,
         _ => false,
     };
     let _life = (moves_cap || matches!(id, CAP_GRANT | RESTORE_OF | SPAWN | WAIT | TASK_START | THREAD_CREATE)).then(task::lifecycle);
     let out = match id {
         YIELD => Out::Ret(0),
         IPC_SEND | IPC_CALL => ipc_send(cur, a1, [a2, a3, a4], id == IPC_CALL, f.x[5]),
-        IPC_RECV => ipc_recv(cur, a1, a2 & 1 != 0, a2 & RECV_ACCEPT != 0), // a2 bit 0: do not wait (E_AGAIN, -10, if nothing is queued); bit 1: take a capability that comes with the message
+        IPC_WAIT_ANY => ipc_wait_any(cur, a1, a2, a3),
+        IPC_RECV => ipc_recv(cur, a1, a2 & 1 != 0, a2 & RECV_ACCEPT != 0, a3), // a2 bit 0: do not wait (E_AGAIN, -10, if nothing is queued); bit 1: take a capability that comes with the message
         IPC_REPLY => match cap_spec(cur, a4) {
             Ok(cap) => Out::Ret(if ipc::reply(cur, [a1, a2, a3], cap) { 0 } else { E_NOREPLY }),
             Err(e) => Out::Ret(e),
@@ -464,12 +471,48 @@ fn ipc_send(cur: usize, slot: u64, w: [u64; 3], call: bool, spec: u64) -> Out {
     }
 }
 
-fn ipc_recv(cur: usize, slot: u64, nonblock: bool, accept: bool) -> Out {
+/// The counter value a timed receive gives up at (0: it does not): `us` microseconds from now, at most an hour.
+fn recv_deadline(us: u64, nonblock: bool) -> u64 {
+    if us == 0 || nonblock {
+        return 0;
+    }
+    timer::counter().saturating_add(timer::us_to_counter(us.min(3_600_000_000))).min(1 << 55)
+}
+
+fn ipc_wait_any(cur: usize, mask: u64, flags: u64, timeout_us: u64) -> Out {
+    if mask == 0 || mask >> NCAPS != 0 {
+        return Out::Ret(E_INVAL);
+    }
+    let mut srcs = [ipc::Src { e: 0, slot: 0 }; NCAPS];
+    let mut n = 0;
+    for i in 0..NCAPS {
+        if mask >> i & 1 == 0 {
+            continue;
+        }
+        let c = match lookup(cur, i as u64, Kind::Endpoint, R_RECV) {
+            Ok(c) => c,
+            Err(e) => return Out::Ret(e),
+        };
+        if !srcs[..n].iter().any(|s| s.e == c.obj) {
+            srcs[n] = ipc::Src { e: c.obj, slot: i as u8 };
+            n += 1;
+        }
+    }
+    let nonblock = flags & 1 != 0;
+    match ipc::recv_any(cur, &srcs[..n], !nonblock, flags & RECV_ACCEPT != 0, recv_deadline(timeout_us, nonblock)) {
+        ipc::Recv::Got => Out::Ret(0), // payload already in x1..x5
+        ipc::Recv::Blocked => Out::Block,
+        ipc::Recv::Busy => Out::Ret(E_FULL),
+        ipc::Recv::Empty => Out::Ret(crate::spawn::E_AGAIN),
+    }
+}
+
+fn ipc_recv(cur: usize, slot: u64, nonblock: bool, accept: bool, timeout_us: u64) -> Out {
     let c = match lookup(cur, slot, Kind::Endpoint, R_RECV) {
         Ok(c) => c,
         Err(e) => return Out::Ret(e),
     };
-    match ipc::recv(cur, c.obj, !nonblock, accept) {
+    match ipc::recv(cur, c.obj, !nonblock, accept, recv_deadline(timeout_us, nonblock)) {
         ipc::Recv::Got => Out::Ret(0), // payload already in x1..x5
         ipc::Recv::Blocked => Out::Block,
         ipc::Recv::Busy => Out::Ret(E_FULL),
@@ -715,6 +758,7 @@ fn sysinfo(cur: usize, page: u64, arg: u64) -> Out {
                 State::ChildWait(_) => 8,
                 State::Embryo => 9,
                 State::WordWait(_) => 10,
+                State::MultiWait(_) | State::MultiClaimed => 2, // (waiting to receive, as `RecvWait`)
             };
             let nm = info(t).name;
             let name = nm.as_bytes();

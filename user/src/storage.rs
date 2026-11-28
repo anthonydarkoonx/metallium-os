@@ -12,7 +12,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-// disk layout (must match tools/mkdisk.py)
+// disk layout (must match tools/mkdisk.py). The system partition starts at sector 1024; its size is in the disk header (layout 5: `SYSTEM_MIB` of mkdisk.py), and the
+// data partition follows it. These are the sizes of the default disk, which is what an older disk (layout 4) has: see `layout`.
 const ROFS_BASE: u64 = 1024;
 const ROFS_SECTORS: u64 = 12288;
 const LFS_BASE: u64 = 13312;
@@ -22,6 +23,8 @@ const LFS_SECTORS: u64 = 11264; // (what the data store gets when the block driv
 const ROFS_READ: u64 = 30; // path in shm[0..256) -> data in shm[256..)
 const ROFS_STAT: u64 = 32; // -> reply [0, size, kind(1 file / 2 dir)]
 const ROFS_LIST: u64 = 31; // path in shm[0..256) -> '\n'-separated names in shm[256..)
+const ROFS_READLINK: u64 = 33; // path (its last component not followed) -> the target of the symbolic link in shm[256..) -> [0, bytes]; 6 if it is not a link
+const ROFS_LSTAT: u64 = 34; // like ROFS_STAT, but a symbolic link is reported as itself: kind 3, its size the length of its target
 const LFS_PUT: u64 = 40; // w1 = key, 4 KiB block in shm
 const LFS_GET: u64 = 41;
 const LFS_SYNC: u64 = 42; // reply: device_writes, logical_writes
@@ -347,9 +350,24 @@ fn map_server_memory(buf_slot: u64) {
 // ---------------------------------------------------------------------------
 // role 5: EROFS system-partition server (read-only)
 // ---------------------------------------------------------------------------
+/// The disk's layout from sector 0: (sectors of the system partition, first sector of the data partition). Layout 5 has the size in bytes 48..56 of the
+/// header; a disk made before that (layout 4), or a header that does not make sense, has the sizes of the default disk.
+fn layout() -> (u64, u64) {
+    let hdr = BlkDev { ep: 1, buf: va(SERVER_BUF_VA), base: 0, blocks: 1 };
+    let mut b = Box::new([0u8; 4096]);
+    if hdr.read_block(0, &mut b).is_ok() && &b[40..48] == b"layout=5" {
+        let rofs = u64::from_le_bytes(b[48..56].try_into().unwrap());
+        if (2048..1 << 32).contains(&rofs) && rofs % 8 == 0 {
+            return (rofs, ROFS_BASE + rofs);
+        }
+    }
+    (ROFS_SECTORS, LFS_BASE)
+}
+
 pub fn rofs_server() -> ! {
     map_server_memory(2);
-    let dev = BlkDev { ep: 1, buf: va(SERVER_BUF_VA), base: ROFS_BASE, blocks: ROFS_SECTORS / 8 };
+    let (rofs_sectors, _) = layout();
+    let dev = BlkDev { ep: 1, buf: va(SERVER_BUF_VA), base: ROFS_BASE, blocks: rofs_sectors / 8 };
     let src = BlkSource { dev, cache: RefCell::new((u64::MAX, Box::new([0; 4096]))) };
     let fs = match metallium_erofs::Erofs::new(src) {
         Ok(fs) => fs,
@@ -368,8 +386,14 @@ pub fn rofs_server() -> ! {
         let own: [u8; DATA_OFF] = snapshot(&page[..DATA_OFF]); // (the client may rewrite the page while we parse it)
         let plen = own.iter().position(|&c| c == 0).unwrap_or(DATA_OFF);
         let path = core::str::from_utf8(&own[..plen]).unwrap_or("");
-        let ino = match fs.lookup(path) {
+        // symbolic links are followed in every component, and in the last one except for `lstat` and `readlink`; a loop or a long chain is status 11
+        let follow = !matches!(m.w[0], ROFS_LSTAT | ROFS_READLINK);
+        let ino = match fs.resolve(path, follow) {
             Ok(i) => i,
+            Err(metallium_erofs::Error::TooManyLinks) => {
+                reply([11, 0, 0]);
+                continue;
+            }
             Err(_) => {
                 reply([1, 0, 0]);
                 continue;
@@ -379,6 +403,16 @@ pub fn rofs_server() -> ! {
             ROFS_STAT => {
                 reply([0, ino.size, if ino.is_dir() { 2 } else { 1 }]);
             }
+            ROFS_LSTAT => {
+                reply([0, ino.size, if ino.is_symlink() { 3 } else if ino.is_dir() { 2 } else { 1 }]);
+            }
+            ROFS_READLINK => {
+                match fs.readlink(&ino, &mut page[DATA_OFF..]) {
+                    Ok(n) => reply([0, n as u64, 0]),
+                    Err(metallium_erofs::Error::NotLink) => reply([6, 0, 0]),
+                    Err(_) => reply([7, 0, 0]),
+                };
+            }
             ROFS_READ if ino.is_file() => {
                 let len = (m.w[2] as usize).min(4096 - DATA_OFF);
                 match fs.read(&ino, m.w[1], &mut page[DATA_OFF..DATA_OFF + len]) {
@@ -387,20 +421,31 @@ pub fn rofs_server() -> ! {
                 };
             }
             ROFS_LIST if ino.is_dir() => {
-                let mut out = Vec::new();
+                // `w[1]` entries are skipped (a directory too big for one page is read in pieces: the caller asks again from where the last piece ended); only whole
+                // names are put in the page, and the third reply word says whether more are left
+                let cursor = m.w[1] as usize;
+                let cap = 4096 - DATA_OFF;
+                let (mut out, mut seen, mut more) = (Vec::new(), 0usize, false);
                 let _ = fs.read_dir(&ino, |n, _, ftype| {
-                    if n != b"." && n != b".." {
+                    if n == b"." || n == b".." {
+                        return true;
+                    }
+                    if seen >= cursor {
+                        if out.len() + n.len() + 2 > cap {
+                            more = true;
+                            return false;
+                        }
                         out.extend_from_slice(n);
                         if ftype == 2 {
                             out.push(b'/'); // directories carry a trailing slash
                         }
                         out.push(b'\n');
                     }
+                    seen += 1;
                     true
                 });
-                let n = out.len().min(4096 - DATA_OFF);
-                page[DATA_OFF..DATA_OFF + n].copy_from_slice(&out[..n]);
-                reply([0, n as u64, 0]);
+                page[DATA_OFF..DATA_OFF + out.len()].copy_from_slice(&out);
+                reply([0, out.len() as u64, more as u64]);
             }
             _ => {
                 reply([3, 0, 0]);
@@ -414,12 +459,13 @@ pub fn rofs_server() -> ! {
 // ---------------------------------------------------------------------------
 pub fn lfs_server() -> ! {
     map_server_memory(2);
-    // the data partition is the rest of the disk, whatever its size (tools/mkdisk.py leaves it to us)
+    // the data partition is the rest of the disk, whatever its size (tools/mkdisk.py leaves it to us); where it starts depends on the size of the system partition
+    let (_, lfs_base) = layout();
     let sectors = match call(1, [BLK_INFO, 0, 0]) {
-        (0, r) if r[0] >= LFS_BASE + 4096 => r[0] - LFS_BASE,
+        (0, r) if r[0] >= lfs_base + 4096 => r[0] - lfs_base,
         _ => LFS_SECTORS,
     };
-    let raw = BlkDev { ep: 1, buf: va(SERVER_BUF_VA), base: LFS_BASE, blocks: sectors / 8 };
+    let raw = BlkDev { ep: 1, buf: va(SERVER_BUF_VA), base: lfs_base, blocks: sectors / 8 };
     println!("[lfs] data partition: {} KiB", sectors / 2);
     let secret = device_secret();
     let mut header0 = Box::new([0u8; metallium_crypt::HEADER_LEN]);

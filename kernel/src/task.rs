@@ -131,6 +131,12 @@ pub enum State {
     WordWait(u64),
     /// A program created by SPAWN whose code is still being loaded by its parent (spawn.rs); never scheduled.
     Embryo,
+    /// Blocked in `IPC_WAIT_ANY`: registered as the waiter (under this token) on every endpoint of its set. Whichever sender gets
+    /// to claim the task first (`sched::claim_multi`) delivers its message; the registrations on the other endpoints are left behind and are recognised as
+    /// stale by the token, so nothing has to be undone under their locks.
+    MultiWait(u32),
+    /// Claimed by a sender (or a timeout, or the task itself) that is writing its result registers: not runnable until it is made `Ready`.
+    MultiClaimed,
     Dead,
 }
 
@@ -764,8 +770,7 @@ impl World {
             let still = lock(r).caps.iter().any(|c| c.kind == Kind::Endpoint && c.obj as usize == e && c.rights & R_RECV != 0 && c.alive());
             if !still {
                 ep.waiter = None;
-                frame(r).x[0] = crate::syscall::E_BADCAP as u64;
-                sched::wake_if(r, State::RecvWait(e as u16));
+                ipc::fail_waiter(e as u16, r, ep.tok, crate::syscall::E_BADCAP);
             }
         }
         crate::ipc::destroy_marked(marked);

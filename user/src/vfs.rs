@@ -26,6 +26,11 @@ const V_SEEK: u64 = 53; // w1 = fd, w2 = offset
 const V_CLOSE: u64 = 54; // w1 = fd (commits written data)
 const V_STAT: u64 = 55; // path in page -> [0, size, kind]
 const V_LIST: u64 = 56; // path in page -> names '\n'-separated at page[256..] -> [0, bytes]
+const V_LOCK: u64 = 69; // w1 = fd, w2 = 1 shared / 2 exclusive / 3 unlock: an advisory lock on the open file; EAGAIN if another open file holds a conflicting one (it never waits)
+const V_STAT_TIME: u64 = 68; // path in page, w1 = 1: do not follow a symbolic link in the last component -> [0, size, kind | modification time (seconds since 1970, 0 if not known) << 8]
+const V_LSTAT: u64 = 66; // like V_STAT, but a symbolic link is reported as itself: [0, length of its target, 3]
+const V_READLINK: u64 = 67; // path in page (the last component not followed) -> the target at page[256..] -> [0, bytes]; EINVAL if it is not a symbolic link
+const V_LIST_AT: u64 = 65; // path in page, w1 = entries already received -> the next whole names at page[256..] -> [0, bytes, 1 if more are left]
 const V_UNLINK: u64 = 57;
 const V_MKDIR: u64 = 58;
 const V_SYNC: u64 = 59;
@@ -46,6 +51,8 @@ pub const EIO: u64 = 7;
 pub const EEXIST: u64 = 8;
 pub const ENOTEMPTY: u64 = 9;
 pub const EPERM: u64 = 10; // (V_SCOPE: not the program's parent)
+pub const ELOOP: u64 = 11; // too many symbolic links (a loop, or a chain longer than 16)
+pub const EAGAIN: u64 = 12; // V_LOCK: the file is locked by someone else
 
 /// A scoped program (see `V_SCOPE`) may have at most this many entries (files and directories) under its directory: the data
 /// store has few, and one program must not be able to use them all up.
@@ -75,6 +82,8 @@ const BS: usize = 4096;
 // ---- backend protocols (see storage.rs) ----
 const ROFS_READ: u64 = 30;
 const ROFS_LIST: u64 = 31;
+const ROFS_READLINK: u64 = 33;
+const ROFS_LSTAT: u64 = 34;
 const ROFS_STAT: u64 = 32;
 const LFS_PUT: u64 = 40;
 const LFS_GET: u64 = 41;
@@ -238,10 +247,33 @@ fn rofs_path(p: &str) {
     pg.put(p.len(), &[0]);
 }
 
+/// The VFS status for the status the system-partition server answered with.
+fn rofs_status(code: u64) -> u64 {
+    match code {
+        1 => ENOENT,
+        2 | 3 => EISDIR,
+        6 => EINVAL,
+        11 => ELOOP,
+        _ => EIO,
+    }
+}
+
 fn rofs_stat(p: &str) -> Result<(u64, u64), u64> {
     rofs_path(p);
     let r = backend(SL_ROFS_EP, [ROFS_STAT, 0, 0]).ok_or(EIO)?;
-    if r[0] == 0 { Ok((r[2], r[1])) } else { Err(ENOENT) }
+    if r[0] == 0 { Ok((r[2], r[1])) } else { Err(rofs_status(r[0])) }
+}
+
+fn rofs_lstat(p: &str) -> Result<(u64, u64), u64> {
+    rofs_path(p);
+    let r = backend(SL_ROFS_EP, [ROFS_LSTAT, 0, 0]).ok_or(EIO)?;
+    if r[0] == 0 { Ok((r[2], r[1])) } else { Err(rofs_status(r[0])) }
+}
+
+fn rofs_readlink(p: &str) -> Result<Vec<u8>, u64> {
+    rofs_path(p);
+    let r = backend(SL_ROFS_EP, [ROFS_READLINK, 0, 0]).ok_or(EIO)?;
+    if r[0] == 0 { Ok(page(va(VA_ROFS)).vec(DATA, r[1] as usize)) } else { Err(rofs_status(r[0])) }
 }
 
 fn rofs_read(p: &str, off: u64, out: &mut [u8]) -> Result<usize, u64> {
@@ -255,18 +287,45 @@ fn rofs_read(p: &str, off: u64, out: &mut [u8]) -> Result<usize, u64> {
         }
         1 => Err(ENOENT),
         3 => Err(EISDIR),
+        11 => Err(ELOOP),
         _ => Err(EIO),
     }
 }
 
 fn rofs_list(p: &str) -> Result<Vec<u8>, u64> {
+    rofs_list_at(p, 0).map(|(v, _)| v)
+}
+
+/// The names of `/system` directory `p` after the first `cursor`, as many whole ones as fit a page, and whether there are more.
+fn rofs_list_at(p: &str, cursor: u64) -> Result<(Vec<u8>, bool), u64> {
     rofs_path(p);
-    let r = backend(SL_ROFS_EP, [ROFS_LIST, 0, 0]).ok_or(EIO)?;
+    let r = backend(SL_ROFS_EP, [ROFS_LIST, cursor, 0]).ok_or(EIO)?;
     match r[0] {
-        0 => Ok(page(va(VA_ROFS)).vec(DATA, r[1] as usize)),
+        0 => Ok((page(va(VA_ROFS)).vec(DATA, r[1] as usize), r[2] != 0)),
         1 => Err(ENOENT),
+        11 => Err(ELOOP),
         _ => Err(EISDIR),
     }
+}
+
+/// The lines of the '\n'-separated listing `v` after the first `cursor`, as many whole ones as fit a page, and whether there are more.
+fn lines_from(v: &[u8], cursor: usize) -> (Vec<u8>, bool) {
+    let mut at = 0;
+    for _ in 0..cursor {
+        match v[at..].iter().position(|&c| c == b'\n') {
+            Some(i) => at += i + 1,
+            None => return (Vec::new(), false),
+        }
+    }
+    let mut end = at;
+    while end < v.len() {
+        let line = v[end..].iter().position(|&c| c == b'\n').map_or(v.len() - end, |i| i + 1);
+        if end + line - at > MAXIO {
+            return (v[at..end].to_vec(), true);
+        }
+        end += line;
+    }
+    (v[at..end].to_vec(), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,13 +347,27 @@ const INO_COUNTER_MAX: u32 = (1 << 24) - 16;
 fn domain_of_ino(ino: u32) -> u32 {
     (ino >> DOMAIN_SHIFT) & 0x3F
 }
-const NENT: usize = 1024;
+/// Entries (files and directories) in `/data`, for the whole machine. A table written with fewer reads as it was (the blocks it never wrote are free entries), so raising this
+/// changes nothing on a disk that is already in use. The entries are searched one after the other, so a lookup costs time in proportion.
+const NENT: usize = 4096;
 const PATH_MAX: usize = 128;
 const ENT_SZ: usize = 144;
 /// Entries per metadata block (the first 16 bytes of each block are its header) and the blocks the table takes. Block 0 is `META_KEY`, block b is `META_MORE + b`.
 const EPB: usize = (BS - 16) / ENT_SZ;
 const META_BLOCKS: usize = NENT.div_ceil(EPB);
 const META_MORE: u64 = 0x1000;
+/// The modification times: one block, a `u32` (seconds since 1970; 0 = not known) for each table slot, written in the same checkpoint as the table so that the two are
+/// never out of step. A table from before there was one has none: every time reads 0 until the file is next written.
+const META_TIMES: u64 = 0x3000;
+/// Times in a block (a `u32` each) and the blocks they take: block `b` is key `META_TIMES + b` and holds the times of entries `b * TPB ..`.
+const TPB: usize = BS / 4;
+const TIME_BLOCKS: usize = NENT.div_ceil(TPB);
+
+/// The wall clock in seconds since 1970, 0 if the machine has none (`CLOCK` answers `E_NOSYS`).
+fn now_secs() -> u32 {
+    let r = svc(34, 1, 0, 0, 0, 0)[0] as i64;
+    if r < 0 { 0 } else { (r as u64 / 1_000_000_000) as u32 }
+}
 /// The journal is spread the same way: 16 bytes per entry, block b at `JOURNAL_MORE + b` (block 0 is `JOURNAL_KEY`).
 const JEPB: usize = (BS - 16) / 16;
 const JOURNAL_BLOCKS: usize = NENT.div_ceil(JEPB);
@@ -429,6 +502,9 @@ struct Datafs {
     meta_hash: Vec<u64>,
     /// The same for the journal blocks after the first (0: empty and never written).
     jhash: Vec<u64>,
+    /// Modification time of each entry (see `META_TIMES`), and a hash of each block of them as last read or written (0: never written).
+    times: Vec<u32>,
+    times_hash: Vec<u64>,
 }
 
 fn fnv(b: &[u8]) -> u64 {
@@ -452,6 +528,8 @@ impl Datafs {
             jdirty: false,
             meta_hash: vec![0; META_BLOCKS],
             jhash: vec![0; JOURNAL_BLOCKS],
+            times: vec![0; NENT],
+            times_hash: vec![0; TIME_BLOCKS],
         };
         match lfs_get(META_KEY) {
             Ok(true) => {
@@ -490,6 +568,22 @@ impl Datafs {
                     for b in 0..META_BLOCKS {
                         if b == 0 || d.meta_present(b) {
                             d.meta_hash[b] = fnv(&d.meta_block(b));
+                        }
+                    }
+                    for b in 0..TIME_BLOCKS {
+                        match lfs_get(META_TIMES + b as u64) {
+                            Ok(true) => {
+                                let blk = page(va(VA_LFS)).vec(0, BS);
+                                for k in 0..TPB.min(NENT - b * TPB) {
+                                    d.times[b * TPB + k] = u32::from_le_bytes(blk[k * 4..k * 4 + 4].try_into().unwrap());
+                                }
+                                d.times_hash[b] = fnv(&blk);
+                            }
+                            Ok(false) => {} // (never written: all unknown)
+                            Err(_) => {
+                                println!("[vfs] cannot read /data metadata; refusing to start");
+                                exit(1)
+                            }
                         }
                     }
                 }
@@ -667,6 +761,17 @@ impl Datafs {
             lfs_put(if b == 0 { META_KEY } else { META_MORE + b as u64 })?;
             hashes[b] = h;
         }
+        // the times, in the same checkpoint: the blocks that changed (one that was never written and holds no time is skipped)
+        let mut times_hash = self.times_hash.clone();
+        for b in 0..TIME_BLOCKS {
+            let tblk = self.times_block(b);
+            let th = fnv(&tblk);
+            if th != self.times_hash[b] && (self.times_hash[b] != 0 || self.times[b * TPB..((b + 1) * TPB).min(NENT)].iter().any(|&t| t != 0)) {
+                page(va(VA_LFS)).put(0, &tblk);
+                lfs_put(META_TIMES + b as u64)?;
+                times_hash[b] = th;
+            }
+        }
         let mut jhashes = self.jhash.clone();
         if self.jdirty {
             for b in 0..JOURNAL_BLOCKS {
@@ -683,6 +788,7 @@ impl Datafs {
         lfs_sync()?;
         self.meta_hash = hashes;
         self.jhash = jhashes;
+        self.times_hash = times_hash;
         self.dirty = false;
         self.jdirty = false;
         Ok(())
@@ -690,6 +796,30 @@ impl Datafs {
 
     fn find(&self, p: &str) -> Option<usize> {
         self.ents.iter().position(|e| e.ino != 0 && e.path() == p)
+    }
+
+    /// Block `b` of modification times (see `META_TIMES`).
+    fn times_block(&self, b: usize) -> [u8; BS] {
+        let mut blk = [0u8; BS];
+        for (k, t) in self.times[b * TPB..((b + 1) * TPB).min(NENT)].iter().enumerate() {
+            blk[k * 4..k * 4 + 4].copy_from_slice(&t.to_le_bytes());
+        }
+        blk
+    }
+
+    /// Entry `slot` was changed now; the table is committed with the next flush.
+    fn touch(&mut self, slot: usize) {
+        self.times[slot] = now_secs();
+        self.dirty = true;
+    }
+
+    /// The directory that contains `p` had an entry made or removed (the top directory has no entry of its own).
+    fn touch_parent(&mut self, p: &str) {
+        if let Some(i) = p.rfind('/').filter(|&i| i > 0) {
+            if let Some(s) = self.find(&p[..i]) {
+                self.touch(s);
+            }
+        }
     }
 
     fn parent_is_dir(&self, p: &str) -> bool {
@@ -731,7 +861,8 @@ impl Datafs {
         e.kind = kind;
         self.next_ino += 2; // a pair: the file's current and its shadow inode
         self.ents[slot] = e;
-        self.dirty = true;
+        self.touch(slot);
+        self.touch_parent(p);
         Ok(slot)
     }
 
@@ -908,6 +1039,9 @@ impl Datafs {
 
     /// The writer closes: flip the file to its new version in one checkpoint, then free the old blocks.
     fn commit(&mut self, slot: usize) -> Result<(), u64> {
+        if self.shadow[slot].is_some() || self.session[slot].is_some() {
+            self.touch(slot); // (a writer closes: the file was changed now; the flush below commits the time with the data)
+        }
         if let Some(sh) = self.shadow[slot].take() {
             // Blocks staged with a store instance that has since restarted are gone; flipping the table to them
             // would publish a file whose data reads back as zeros or as an older version.
@@ -978,8 +1112,11 @@ impl Datafs {
             }
         }
         self.wgen[i] = self.wgen[i].wrapping_add(1); // any writer still holding the file loses it
+        let gone = String::from(self.ents[i].path());
         self.ents[i] = Ent::FREE;
+        self.times[i] = 0;
         self.dirty = true;
+        self.touch_parent(&gone);
         Ok(garbage)
     }
 
@@ -1019,7 +1156,9 @@ impl Datafs {
             e.path = [0; PATH_MAX];
             e.path[..p.len()].copy_from_slice(p.as_bytes());
         }
-        self.dirty = true;
+        self.touch(i);
+        self.touch_parent(from);
+        self.touch_parent(to);
         Ok(())
     }
 
@@ -1114,6 +1253,7 @@ pub fn vfs_server() -> ! {
     let mut gens = vec![0u64; slots];
     // per program: (the generation of its session, the directory it is confined to); valid only while the generation matches
     let mut scopes: Vec<Option<Scope>> = (0..slots).map(|_| None).collect();
+    let mut locks: Vec<FileLock> = Vec::new();
     loop {
         let m = recv(0);
         let Some((va, fresh, who)) = client_page(m.sender, &mut gens) else {
@@ -1122,6 +1262,16 @@ pub fn vfs_server() -> ! {
         };
         if fresh {
             fds[who] = vec![Fd::Free; FDS]; // a new program in that task slot: nothing of its predecessor's is open
+            locks.retain(|l| l.who != who); // ... and nothing of its predecessor's is locked
+        }
+        if m.w[0] == V_LOCK {
+            reply(lock_request(&fds, &gens, &mut locks, who, m.w[1], m.w[2]));
+            continue;
+        }
+        if m.w[0] == V_CLOSE {
+            if let Some(idx) = fd_slot(&fds[who], m.w[1]) {
+                locks.retain(|l| !(l.who == who && l.idx == idx)); // (the descriptor is free after this: its lock goes with it)
+            }
         }
         if (m.w[0] == V_CRASH || m.w[0] == V_FAIL_SYNC) && m.sender != 0 {
             reply([EINVAL, 0, 0]); // fault injection is the test conductor's tool, not every client's
@@ -1136,6 +1286,53 @@ pub fn vfs_server() -> ! {
         let scope = scopes[who].as_ref().filter(|(g, _, _)| *g == gens[who]).map(|(_, d, q)| (d.clone(), q.clone()));
         let r = handle(&mut ds, table, pg, m.w, scope.as_ref().map(|(d, _)| d.as_str()), scope.as_ref().map_or(&[][..], |(_, q)| q.as_slice()));
         reply(r);
+    }
+}
+
+/// An advisory lock on an open file (`V_LOCK`, like `flock`): held by one open file description (client `who`, descriptor table entry `idx`), on one file.
+/// Any number of shared locks, or one exclusive; asking again on the same descriptor converts it. It goes with the descriptor: `close`, and a new program in
+/// the client's task slot (see the main loop), release it. Locks are advisory: nothing but a program that asks for one is kept out, and a lock is held on a
+/// `/data` file only (the system partition is read-only: a lock there is always granted and holds nothing).
+#[derive(Clone, Copy)]
+struct FileLock {
+    who: usize,
+    idx: usize,
+    ino: u32,
+    exclusive: bool,
+}
+
+/// Does client `who` still have the session it had (a program that ended, or was replaced, left its locks behind: the server is told nothing, but the kernel knows)?
+fn client_alive(who: usize, gens: &[u64]) -> bool {
+    if who == 0 || who == 8 || who as u64 == SHELL_TASK.load(core::sync::atomic::Ordering::Relaxed) {
+        return true; // (the conductor, the console and the shell have sessions of their own for good)
+    }
+    let r = sysinfo_at(5, who as u64);
+    (r[1] as usize) < PROG_SESSIONS.load(core::sync::atomic::Ordering::Relaxed) && r[2] == gens[who]
+}
+
+fn lock_request(fds: &[Vec<Fd>], gens: &[u64], locks: &mut Vec<FileLock>, who: usize, fd: u64, op: u64) -> [u64; 3] {
+    let Some(idx) = fd_slot(&fds[who], fd) else { return [EBADF, 0, 0] };
+    locks.retain(|l| l.who == who || client_alive(l.who, gens)); // (locks of programs that have ended are gone)
+    let ino = match fds[who][idx] {
+        Fd::Data { ino, .. } => ino,
+        Fd::Rofs { .. } => return if (1..=3).contains(&op) { [0, 0, 0] } else { [EINVAL, 0, 0] },
+        Fd::Free => return [EBADF, 0, 0],
+    };
+    match op {
+        3 => {
+            locks.retain(|l| !(l.who == who && l.idx == idx));
+            [0, 0, 0]
+        }
+        1 | 2 => {
+            let exclusive = op == 2;
+            if locks.iter().any(|l| l.ino == ino && !(l.who == who && l.idx == idx) && (l.exclusive || exclusive)) {
+                return [EAGAIN, 0, 0];
+            }
+            locks.retain(|l| !(l.who == who && l.idx == idx));
+            locks.push(FileLock { who, idx, ino, exclusive });
+            [0, 0, 0]
+        }
+        _ => [EINVAL, 0, 0],
     }
 }
 
@@ -1322,10 +1519,53 @@ fn handle(ds: &mut Datafs, table: &mut [Fd], pg: Pg, w: [u64; 3], scope: Option<
             }
             [0, 0, 0]
         }
-        V_STAT | V_LIST | V_UNLINK | V_MKDIR => {
+        V_STAT | V_STAT_TIME | V_LSTAT | V_READLINK | V_LIST | V_LIST_AT | V_UNLINK | V_MKDIR => {
             let Some(p) = get_path(pg) else { return err(EINVAL) };
             let Some(rt) = route_scoped(&p, scope) else { return err(ENOENT) };
             match (w[0], rt) {
+                (V_STAT_TIME, Route::Root) => [0, 0, 2],
+                (V_STAT_TIME, Route::Rofs(r)) => (if w[1] == 1 { rofs_lstat(&r) } else { rofs_stat(&r) }).map_or_else(err, |(k, s)| [0, s, k]), // (the system image has no times: 0)
+                (V_STAT_TIME, Route::Data(r)) if r == "/" => [0, 0, 2],
+                (V_STAT_TIME, Route::Data(r)) => match ds.find(&r) {
+                    Some(s) => [0, ds.ents[s].size, ds.ents[s].kind as u64 | (ds.times[s] as u64) << 8],
+                    None => err(ENOENT),
+                },
+                (V_LSTAT, Route::Rofs(r)) => rofs_lstat(&r).map_or_else(err, |(k, s)| [0, s, k]),
+                (V_LSTAT, Route::Root) => [0, 0, 2],
+                (V_LSTAT, Route::Data(r)) if r == "/" => [0, 0, 2],
+                (V_LSTAT, Route::Data(r)) => match ds.find(&r) {
+                    Some(s) => [0, ds.ents[s].size, ds.ents[s].kind as u64], // (/data has no symbolic links: lstat is stat)
+                    None => err(ENOENT),
+                },
+                (V_READLINK, Route::Rofs(r)) => match rofs_readlink(&r) {
+                    Ok(t) => {
+                        pg.put(DATA, &t);
+                        [0, t.len() as u64, 0]
+                    }
+                    Err(e) => err(e),
+                },
+                (V_READLINK, Route::Data(r)) if ds.find(&r).is_none() => err(ENOENT),
+                (V_READLINK, _) => err(EINVAL), // (not a symbolic link)
+                (V_LIST_AT, rt) => {
+                    let cursor = w[1];
+                    let listing = match rt {
+                        Route::Root => Ok(if cursor == 0 { (b"system/\ndata/\n".to_vec(), false) } else { (Vec::new(), false) }),
+                        Route::Rofs(r) => rofs_list_at(&r, cursor),
+                        Route::Data(r) => match (r == "/", ds.find(&r)) {
+                            (true, _) => Ok(lines_from(&ds.list("/"), cursor as usize)),
+                            (_, Some(s)) if ds.ents[s].kind == KIND_DIR => Ok(lines_from(&ds.list(&r), cursor as usize)),
+                            (_, Some(_)) => Err(EISDIR),
+                            _ => Err(ENOENT),
+                        },
+                    };
+                    match listing {
+                        Ok((v, more)) => {
+                            pg.put(DATA, &v);
+                            [0, v.len() as u64, more as u64]
+                        }
+                        Err(e) => err(e),
+                    }
+                }
                 (V_STAT, Route::Root) => [0, 0, 2],
                 (V_STAT, Route::Rofs(r)) => rofs_stat(&r).map_or_else(err, |(k, s)| [0, s, k]),
                 (V_STAT, Route::Data(r)) if r == "/" => [0, 0, 2],
@@ -1508,9 +1748,51 @@ impl Vfs {
     pub fn stat(&self, path: &str) -> VResult<(u64, u64)> {
         self.with_path(path, V_STAT, 0).map(|(size, kind)| (kind, size))
     }
+    /// An advisory lock on an open file: `op` 1 shared, 2 exclusive, 3 unlock. `Err(EAGAIN)` if another open file holds a conflicting lock: it does not wait.
+    pub fn flock(&self, fd: u64, op: u64) -> VResult<()> {
+        self.rpc(V_LOCK, fd, op).map(|_| ())
+    }
+    /// (kind, size, modification time in seconds since 1970 (0: not known)) of a path; `nofollow` for a symbolic link itself.
+    pub fn stat_time(&self, path: &str, nofollow: bool) -> VResult<(u64, u64, u64)> {
+        self.with_path(path, V_STAT_TIME, nofollow as u64).map(|(size, kt)| (kt & 0xFF, size, kt >> 8))
+    }
+    /// (kind, size) of a path without following a symbolic link in its last component: kind 3 is a link, its size the length of its target.
+    pub fn lstat(&self, path: &str) -> VResult<(u64, u64)> {
+        self.with_path(path, V_LSTAT, 0).map(|(size, kind)| (kind, size))
+    }
+    /// The target of a symbolic link.
+    pub fn readlink(&self, path: &str) -> VResult<String> {
+        let (n, _) = self.with_path(path, V_READLINK, 0)?;
+        Ok(String::from_utf8_lossy(&self.pg().vec(DATA, n as usize)).into_owned())
+    }
     pub fn list(&self, path: &str) -> VResult<String> {
         let (n, _) = self.with_path(path, V_LIST, 0)?;
         Ok(String::from_utf8_lossy(&self.pg().vec(DATA, n as usize)).into_owned())
+    }
+    /// All the names of a directory, however many: asks for the pieces until there are no more.
+    pub fn list_all(&self, path: &str) -> VResult<String> {
+        let (mut out, mut cursor) = (String::new(), 0u64);
+        loop {
+            let (n, more) = self.with_path(path, V_LIST_AT, cursor)?;
+            let piece = String::from_utf8_lossy(&self.pg().vec(DATA, n as usize)).into_owned();
+            cursor += piece.bytes().filter(|&c| c == b'\n').count() as u64;
+            out.push_str(&piece);
+            if more == 0 || n == 0 {
+                return Ok(out);
+            }
+        }
+    }
+    /// Move a file, or a directory with everything in it, inside `/data` (one commit).
+    pub fn rename(&self, from: &str, to: &str) -> VResult<()> {
+        if from.len() + to.len() + 2 > DATA {
+            return Err(EINVAL as i64);
+        }
+        let pg = self.pg();
+        pg.put(0, from.as_bytes());
+        pg.put(from.len(), &[0]);
+        pg.put(from.len() + 1, to.as_bytes());
+        pg.put(from.len() + 1 + to.len(), &[0]);
+        self.rpc(V_RENAME, 0, 0).map(|_| ())
     }
     pub fn unlink(&self, path: &str) -> VResult<()> {
         self.with_path(path, V_UNLINK, 0).map(|_| ())
@@ -1659,6 +1941,67 @@ pub fn vfs_tests() {
     println!("[client] TEST VFS read /system/hello.txt: {}",
         verdict(h.map_or(false, |b| b == b"Hello from the Metallium-OS system image!\n")));
 
+    // a directory with more names than a page holds is listed in pieces, each from where the last ended
+    let one_page = v.list("/system/usr/share/dirtest").map(|s| s.lines().count()).unwrap_or(0);
+    let all = v.list_all("/system/usr/share/dirtest").unwrap_or_default();
+    let mut names: Vec<&str> = all.lines().collect();
+    let total = names.len();
+    names.sort();
+    names.dedup();
+    println!("[client] TEST a /system directory of 420 entries is listed whole in pieces (one page holds {one_page}, all pieces {total}, {} different, first {:?}): {}", names.len(),
+        names.first(), verdict(one_page < 420 && total == 420 && names.len() == 420 && names[0] == "entry-0000-with-a-longish-name" && names[419] == "entry-0419-with-a-longish-name"));
+
+    // modification times of /data entries: set when a file is made and when a writer closes, on the directory when an entry is added, removed or moved
+    {
+        let secs = |p: &str| v.stat_time(p, false).map(|(_, _, t)| t).unwrap_or(u64::MAX);
+        let wall = svc(34, 1, 0, 0, 0, 0)[0] as i64;
+        let clock = wall > 0;
+        let wall_s = if clock { wall as u64 / 1_000_000_000 } else { 0 };
+        let _ = v.mkdir("/data/times");
+        let made = v.write_file("/data/times/a.txt", b"one").is_ok();
+        let (a1, d1) = (secs("/data/times/a.txt"), secs("/data/times"));
+        if clock {
+            sleep(120); // (the times are whole seconds)
+        }
+        let rewrote = v.write_file("/data/times/a.txt", b"two!").is_ok();
+        let a2 = secs("/data/times/a.txt");
+        let b_made = v.write_file("/data/times/b.txt", b"x").is_ok();
+        let d2 = secs("/data/times");
+        let moved = v.rename("/data/times/a.txt", "/data/times/c.txt").is_ok();
+        let c = secs("/data/times/c.txt");
+        let gone = v.unlink("/data/times/b.txt").is_ok();
+        let d3 = secs("/data/times");
+        let root_and_system = v.stat_time("/data", false) == Ok((2, 0, 0)) && v.stat_time("/system/hello.txt", false).map(|(k, _, t)| (k, t)) == Ok((1, 0));
+        let nothing_there = v.stat_time("/data/times/nope", false) == Err(ENOENT as i64);
+        let ok = if clock {
+            a1 + 5 >= wall_s && a1 <= wall_s + 5 && d1 >= a1 && a2 > a1 && d2 > d1 && c >= a2 && d3 >= d2
+        } else {
+            [a1, d1, a2, d2, c, d3].iter().all(|&t| t == 0)
+        };
+        println!("[client] TEST /data entries have modification times: a file's when it was made and when a writer closed it, its directory's when an entry is added, moved or removed (clock {clock}: made {made} {a1} -> {a2} after a rewrite {rewrote}, directory {d1} -> {d2} -> {d3} {b_made} {moved} {gone}, system image and root {root_and_system}, missing {nothing_there}): {}",
+            verdict(made && rewrote && b_made && moved && gone && root_and_system && nothing_there && ok));
+        for n in ["c.txt", "a.txt", "b.txt"] {
+            let _ = v.unlink(&alloc::format!("/data/times/{n}"));
+        }
+        let _ = v.unlink("/data/times");
+    }
+
+    // symbolic links on /system: followed by open, stat and list (in every component of a path), not by lstat and readlink; loops and long chains are ELOOP
+    {
+        let l = "/system/usr/share/links";
+        let want = b"link target\n".to_vec();
+        let reads: Vec<bool> = ["rel", "abs", "up", "hop19", "hop5"].iter().map(|n| v.read_file(&alloc::format!("{l}/{n}")).map_or(false, |b| b == want)).collect();
+        let through_dir = v.read_file(&alloc::format!("{l}/dirlink/inner.txt")).map_or(false, |b| b == b"inner\n") && v.read_file(&alloc::format!("{l}/dirabs/inner.txt")).map_or(false, |b| b == b"inner\n");
+        let stat_file = v.stat(&alloc::format!("{l}/rel")).map_or(false, |(k, s)| k == 1 && s == 12);
+        let stat_dir = v.stat(&alloc::format!("{l}/dirlink")).map_or(false, |(k, _)| k == 2);
+        let listed = v.list(&alloc::format!("{l}/dirlink")).map_or(false, |s| s.trim_end() == "inner.txt");
+        let lstat = v.lstat(&alloc::format!("{l}/rel")) == Ok((3, 10)) && v.lstat(&alloc::format!("{l}/dirlink")).map(|(k, _)| k) == Ok(3) && v.lstat(&alloc::format!("{l}/target.txt")) == Ok((1, 12)) && v.lstat(&alloc::format!("{l}/sub")).map(|(k, _)| k) == Ok(2);
+        let readlink = v.readlink(&alloc::format!("{l}/rel")).as_deref() == Ok("target.txt") && v.readlink(&alloc::format!("{l}/abs")).as_deref() == Ok("/usr/share/links/target.txt") && v.readlink(&alloc::format!("{l}/target.txt")) == Err(EINVAL as i64) && v.readlink(&alloc::format!("{l}/nope")) == Err(ENOENT as i64);
+        let errors = v.stat(&alloc::format!("{l}/loop1")) == Err(ELOOP as i64) && v.stat(&alloc::format!("{l}/dangling")) == Err(ENOENT as i64) && v.stat(&alloc::format!("{l}/hop0")) == Err(ELOOP as i64) && v.open(&alloc::format!("{l}/loop2"), O_READ) == Err(ELOOP as i64) && v.lstat(&alloc::format!("{l}/loop1")).map(|(k, _)| k) == Ok(3);
+        println!("[client] TEST symbolic links on /system are followed in paths (reads {reads:?}, through directory links {through_dir}, stat of a link: file {stat_file}, directory {stat_dir}, list {listed}), lstat and readlink see the link itself ({lstat} {readlink}), and a loop, a chain of 20 and a dangling link fail with ELOOP and ENOENT ({errors}): {}",
+            verdict(reads.iter().all(|&b| b) && through_dir && stat_file && stat_dir && listed && lstat && readlink && errors));
+    }
+
     let blob = v.read_file("/system/bin/blob.bin");
     println!("[client] TEST VFS read 9000-byte file via fd: {}",
         verdict(blob.map_or(false, |b| b.len() == 9000 && b.iter().enumerate().all(|(i, &x)| x == ((i * 7) % 251) as u8))));
@@ -1681,6 +2024,26 @@ pub fn vfs_tests() {
 
     // /data: nested directory, multi-block file
     let big: Vec<u8> = (0..10000).map(pat).collect();
+    // a /data directory with more names than one page of a listing holds (60 names of 100 characters), listed in pieces
+    let mut made = 0;
+    let _ = v.mkdir("/data/wide");
+    for i in 0..60 {
+        if v.write_file(&alloc::format!("/data/wide/{i:0>100}"), b"x").is_ok() {
+            made += 1;
+        }
+    }
+    let first = v.list("/data/wide").map(|s| s.lines().count()).unwrap_or(0);
+    let all = v.list_all("/data/wide").unwrap_or_default();
+    let mut names: Vec<&str> = all.lines().collect();
+    names.sort();
+    names.dedup();
+    println!("[client] TEST a /data directory of 60 long names is listed whole in pieces (made {made}, one page holds {first}, all pieces {}): {}", names.len(),
+        verdict(made == 60 && first < 60 && names.len() == 60 && names[0].len() == 100));
+    for i in 0..60 {
+        let _ = v.unlink(&alloc::format!("/data/wide/{i:0>100}"));
+    }
+    let _ = v.unlink("/data/wide");
+
     let ok = v.mkdir("/data/docs").is_ok() && v.write_file("/data/docs/note.txt", &big).is_ok();
     let st = v.stat("/data/docs/note.txt");
     let back = v.read_file("/data/docs/note.txt");
@@ -1707,8 +2070,11 @@ pub fn vfs_tests() {
     let keep = b"persist me across crashes";
     let wrote = v.write_file("/data/keep.txt", keep).is_ok();
     let stale = v.open("/data/keep.txt", O_READ).unwrap_or(99);
+    let time_before = v.stat_time("/data/keep.txt", false).map(|(_, _, t)| t);
     let st = v.crash();
     let after = v.read_file("/data/keep.txt");
+    let time_after = v.stat_time("/data/keep.txt", false).map(|(_, _, t)| t);
+    println!("[client] TEST a file's modification time is in the table that survives a restart of the VFS ({time_before:?} before, {time_after:?} after): {}", verdict(time_before.is_ok() && time_before == time_after));
     let mut probe = [0u8; 4];
     let stale_read = v.read(stale, &mut probe);
     println!("[client] TEST VFS data survives vfs-server crash; old fd rejected (status={st}, stale={stale_read:?}): {}",
@@ -2031,7 +2397,7 @@ pub fn volume_test() {
 const C_LFS_SHM2: usize = 0x8035_0000;
 
 /// `make table-test` (`opt/metallium/only=12`): the directory table of `/data`. A table in the older layout (one block, 51 entries) is still read and the next commit
-/// writes the new one; the new one holds hundreds of entries across a restart; long paths work up to the limit.
+/// writes the new one; the new one holds hundreds of entries across a restart, and more than the 1024 it once held; long paths work up to the limit.
 pub fn table_test() {
     fn verdict_line(what: &str, ok: bool) {
         println!("[table] TEST {what}: {}", if ok { "PASS" } else { "FAIL" });
@@ -2093,6 +2459,16 @@ pub fn table_test() {
     sync();
     let _ = v.crash();
     verdict_line("removing half of them is kept across a restart", gone && count(&v) == 150 && v.read_file("/data/many/f000").is_err() && v.read_file("/data/many/f200").is_ok());
+    // ---- more than the table used to hold (1024 entries for the whole machine)
+    let mut ok = v.mkdir("/data/big").is_ok();
+    for i in 0..1500 {
+        ok &= v.write_file(&alloc::format!("/data/big/g{i:04}"), alloc::format!("g{i}").as_bytes()).is_ok();
+    }
+    sync();
+    let big_count = |v: &Vfs| v.list_all("/data/big").map_or(0, |l| l.lines().count());
+    verdict_line("1500 more files, more entries in all than the 1024 the table used to hold", ok && big_count(&v) == 1500);
+    let _ = v.crash();
+    verdict_line("... all there after a restart, in the blocks that table never had", big_count(&v) == 1500 && v.read_file("/data/big/g1499").map_or(false, |b| b == b"g1499") && v.read_file("/data/many/f299").map_or(false, |b| b == b"file 299"));
     // ---- long paths
     let mut dir = String::from("/data");
     let mut deep = true;

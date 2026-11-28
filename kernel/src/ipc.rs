@@ -38,7 +38,7 @@ pub fn init_tables(n: usize) {
     NEP.store(n, Ordering::Relaxed);
     EP_NODE.init(n, |_| AtomicU16::new(NO_OWNER_NODE));
     EP_TASK.init(n, |_| AtomicU16::new(NO_OWNER));
-    EPS.init(n, |_| SpinLock::new(Endpoint { q: [NO_MSG; QLEN], head: 0, len: 0, waiter: None, accepts: false }));
+    EPS.init(n, |_| SpinLock::new(Endpoint { q: [NO_MSG; QLEN], head: 0, len: 0, waiter: None, accepts: false, tok: 0, slot: 0 }));
     BEST.init(n, |_| AtomicU8::new(NO_PRIO));
     QUEUED.init(n, |_| AtomicU8::new(0));
     BEST_DEADLINE.init(n, |_| AtomicU64::new(u64::MAX));
@@ -98,6 +98,11 @@ pub struct Endpoint {
     pub waiter: Option<u16>,
     /// ... and whether it asked to be given a capability that comes with the message (`IPC_RECV` flag 2).
     pub accepts: bool,
+    /// 0: the waiter sleeps in `RecvWait` on this endpoint alone. Otherwise it sleeps in `MultiWait(tok)` and this is one of several endpoints it
+    /// registered on (`recv_any`): the registration only counts while the task is still in that state under that token.
+    pub tok: u32,
+    /// For a registration with a token: the waiter's slot for this endpoint plus one (told to it with the message).
+    pub slot: u8,
 }
 
 impl Endpoint {
@@ -187,9 +192,9 @@ pub fn destroy_marked(marked: &crate::cap::NodeSet) {
         }
         let dead = crate::syscall::E_DEAD;
         let mut ep = lock_ep(e as u16);
+        let tok = ep.tok;
         if let Some(r) = ep.waiter.take() {
-            frame(r as usize).x[0] = dead as u64;
-            sched::wake_if(r as usize, State::RecvWait(e as u16));
+            fail_waiter(e as u16, r as usize, tok, dead);
         }
         let (head, len) = (ep.head, ep.len);
         let queued: [Msg; QLEN] = core::array::from_fn(|k| ep.q[(head + k) % QLEN]);
@@ -299,8 +304,9 @@ fn install_cap(t: &mut task::Task, rcv: usize, c: &Cap) -> u64 {
 }
 
 /// Write a message into a receiver's saved registers (its pending IPC_RECV result): `x1` the sender, `x2`..`x4` the words, `x5` bit 0 whether it is a call
-/// and bits 8..15 the capability that came with it (slot plus one, or `CAP_FAILED`), which is only given to a receiver that `accept`s one.
-fn deliver_regs(rcv: usize, m: &Msg, accept: bool) {
+/// and bits 8..15 the capability that came with it (slot plus one, or `CAP_FAILED`), which is only given to a receiver that `accept`s one. For a receive
+/// on several endpoints (`slot` is the receiver's slot for the one the message came from, plus one) bits 16..23 say which.
+fn deliver_regs(rcv: usize, m: &Msg, accept: bool, slot: u64) {
     let info = match (accept, m.cap) {
         (true, Some(c)) => install_cap(&mut task::lock(rcv), rcv, &c),
         _ => 0,
@@ -311,7 +317,48 @@ fn deliver_regs(rcv: usize, m: &Msg, accept: bool) {
     f.x[2] = m.w[0];
     f.x[3] = m.w[1];
     f.x[4] = m.w[2];
-    f.x[5] = m.call as u64 | info << 8;
+    f.x[5] = m.call as u64 | info << 8 | slot << 16;
+}
+
+/// The task a registration names is really waiting on it (a plain waiter always is; one that registered on several endpoints only while it is still in the wait it
+/// registered under).
+fn waiter_live(ep: &Endpoint) -> bool {
+    match ep.waiter {
+        None => false,
+        Some(_) if ep.tok == 0 => true,
+        Some(r) => sched::state(r as usize) == State::MultiWait(ep.tok),
+    }
+}
+
+/// End a wait with an error in `x0` (the endpoint went away, the receive capability was revoked): for a plain waiter that is whoever finds it registered; for one waiting
+/// on several endpoints, whoever claims it (a stale registration finds the claim taken and does nothing).
+pub fn fail_waiter(e: u16, r: usize, tok: u32, code: i64) {
+    if tok == 0 {
+        frame(r).x[0] = code as u64;
+        sched::wake_if(r, State::RecvWait(e));
+    } else if sched::claim_multi(r, tok) {
+        frame(r).x[0] = code as u64;
+        sched::wake_if(r, State::MultiClaimed);
+    }
+}
+
+/// A timed `IPC_RECV` ran out. Taking the registration under the endpoint's lock settles the race with a sender: whichever gets there first completes the
+/// wait, the other finds nobody waiting.
+pub fn expire(tid: usize, e: u16) {
+    let mut ep = lock_ep(e);
+    if ep.waiter == Some(tid as u16) && ep.tok == 0 {
+        ep.waiter = None;
+        frame(tid).x[0] = crate::syscall::E_TIMEDOUT as u64;
+        sched::wake_if(tid, State::RecvWait(e));
+    }
+}
+
+/// A timed `IPC_WAIT_ANY` ran out: the claim is what settles the race with the senders.
+pub fn expire_multi(tid: usize, tok: u32) {
+    if sched::claim_multi(tid, tok) {
+        frame(tid).x[0] = crate::syscall::E_TIMEDOUT as u64;
+        sched::wake_if(tid, State::MultiClaimed);
+    }
 }
 
 pub enum SendErr {
@@ -325,13 +372,28 @@ pub fn send(cur: usize, e: u16, m: Msg) -> Result<(), SendErr> {
     let sync_call = m.call && m.tag == 0;
     if let Some(r) = ep.waiter.take() {
         let r = r as usize;
-        deliver_regs(r, &m, ep.accepts);
-        if m.call {
-            link_call(r, &m);
+        if ep.tok == 0 {
+            deliver_regs(r, &m, ep.accepts, 0);
+            if m.call {
+                link_call(r, &m);
+            }
+            // sender blocked first, receiver runnable second, in one scheduler critical section
+            sched::block_and_wake(sync_call.then_some((cur, State::CallWait)), Some(r));
+            return Ok(());
         }
-        // sender blocked first, receiver runnable second, in one scheduler critical section
-        sched::block_and_wake(sync_call.then_some((cur, State::CallWait)), Some(r));
-        return Ok(());
+        // A receiver waiting on several endpoints: only the sender that claims it may write its registers (another sender, on another of its endpoints,
+        // may be here at the same moment). A registration whose task is not waiting under that token any more is stale: the message is queued.
+        if sched::claim_multi(r, ep.tok) {
+            deliver_regs(r, &m, ep.accepts, ep.slot as u64);
+            if m.call {
+                link_call(r, &m);
+            }
+            if sync_call {
+                sched::set_state(cur, State::CallWait); // (the sender blocked first, the receiver runnable second)
+            }
+            sched::wake_if(r, State::MultiClaimed);
+            return Ok(());
+        }
     }
     if ep.len == QLEN {
         return Err(SendErr::Full);
@@ -361,14 +423,14 @@ pub enum Recv {
 
 /// Receive on endpoint `e` for task `me`. On `Got` the message is already in `me`'s registers;
 /// on `Blocked` the task is registered and asleep in `RecvWait`.
-pub fn recv(me: usize, e: u16, block: bool, accept: bool) -> Recv {
+pub fn recv(me: usize, e: u16, block: bool, accept: bool, deadline: u64) -> Recv {
     let mut ep = lock_ep(e);
     if ep.len > 0 {
         let m = ep.q[ep.head];
         ep.head = (ep.head + 1) % QLEN;
         ep.len -= 1;
         ep.refresh_best(e);
-        deliver_regs(me, &m, accept);
+        deliver_regs(me, &m, accept, 0);
         if m.call {
             link_call(me, &m);
         }
@@ -377,13 +439,102 @@ pub fn recv(me: usize, e: u16, block: bool, accept: bool) -> Recv {
     if !block {
         return Recv::Empty;
     }
-    if ep.waiter.is_some() {
+    if waiter_live(&ep) {
         return Recv::Busy;
     }
     ep.waiter = Some(me as u16);
     ep.accepts = accept;
+    ep.tok = 0;
+    sched::set_wait_deadline(me, deadline); // (before the state says it waits: the scheduler looks at the deadline then)
     sched::set_state(me, State::RecvWait(e));
     Recv::Blocked
+}
+
+/// An endpoint a receive on several may take a message from, and the receiver's slot for it.
+#[derive(Clone, Copy)]
+pub struct Src {
+    pub e: u16,
+    pub slot: u8,
+}
+
+static MULTI_TOKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn next_token() -> u32 {
+    loop {
+        let t = MULTI_TOKEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if t != 0 {
+            return t;
+        }
+    }
+}
+
+/// Receive on any of the endpoints `srcs` for task `me`. A queued message is taken at once (starting from a different endpoint each time, so a busy low one does not
+/// starve the others); otherwise, if `block`, the task registers on every endpoint and sleeps in `MultiWait`, until a sender claims it (`send`), the deadline passes
+/// (`expire_multi`) or a capability is revoked (`fail_waiter`). The result registers hold the message and, in `x5` bits 16..23, the slot it came from.
+///
+/// Registering takes the endpoints' locks one at a time, so the task is put in `MultiWait` *first*: a message that arrives on an endpoint already registered
+/// claims it and writes its registers; one that arrives on an endpoint not registered yet is found by the registration (it looks at the queue under the lock) and taken by
+/// the task itself, after claiming itself the same way. Either way exactly one message is delivered.
+pub fn recv_any(me: usize, srcs: &[Src], block: bool, accept: bool, deadline: u64) -> Recv {
+    let n = srcs.len();
+    let start = (crate::timer::counter() >> 3) as usize % n.max(1);
+    for k in 0..n {
+        let s = srcs[(start + k) % n];
+        let mut ep = lock_ep(s.e);
+        if ep.len > 0 {
+            let m = pop(&mut ep, s.e);
+            deliver_regs(me, &m, accept, s.slot as u64 + 1);
+            if m.call {
+                link_call(me, &m);
+            }
+            return Recv::Got;
+        }
+    }
+    if !block {
+        return Recv::Empty;
+    }
+    let tok = next_token();
+    sched::set_wait_deadline(me, deadline);
+    sched::set_state(me, State::MultiWait(tok));
+    for s in srcs {
+        if sched::state(me) != State::MultiWait(tok) {
+            break; // a sender has served us already (or the task is condemned): no more registering
+        }
+        let mut ep = lock_ep(s.e);
+        if ep.len > 0 {
+            if !sched::claim_multi(me, tok) {
+                break;
+            }
+            let m = pop(&mut ep, s.e);
+            deliver_regs(me, &m, accept, s.slot as u64 + 1);
+            if m.call {
+                link_call(me, &m);
+            }
+            sched::wake_if(me, State::MultiClaimed);
+            return Recv::Got;
+        }
+        if waiter_live(&ep) {
+            // somebody else waits on this endpoint (one waiter each): the set cannot be waited on
+            if sched::claim_multi(me, tok) {
+                sched::wake_if(me, State::MultiClaimed);
+                return Recv::Busy;
+            }
+            break;
+        }
+        ep.waiter = Some(me as u16);
+        ep.accepts = accept;
+        ep.tok = tok;
+        ep.slot = s.slot + 1;
+    }
+    Recv::Blocked
+}
+
+fn pop(ep: &mut Endpoint, e: u16) -> Msg {
+    let m = ep.q[ep.head];
+    ep.head = (ep.head + 1) % QLEN;
+    ep.len -= 1;
+    ep.refresh_best(e);
+    m
 }
 
 /// Park the call `server` is serving (a synchronous one): the caller stays blocked, the server is free to serve others, and gets back the caller's id as a token for `reply_to`. A server

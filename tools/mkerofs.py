@@ -10,7 +10,10 @@ S_IFDIR, S_IFREG = 0o040000, 0o100000
 
 
 def build(tree):
-    """tree: {name: bytes | dict}. Returns the image as bytes."""
+    """tree: {name: bytes | dict}. Returns the image as bytes. (Symbolic links are left out: this builder cannot write them; mkfs.erofs can.)"""
+    def no_links(t):
+        return {k: no_links(v) for k, v in t.items() if not isinstance(v, Symlink)} if isinstance(t, dict) else t
+    tree = no_links(tree)
     nodes = []  # dicts: kind, data/children, parent
 
     def add(t, parent):
@@ -74,6 +77,13 @@ def build(tree):
 LOREM = "".join("Metallium-OS system image, line %05d: the quick brown fox\n" % i for i in range(4000)).encode()
 
 
+class Symlink:
+    """A symbolic link in a system_tree() dict: `target` as the link says it (relative to the link's directory, or absolute from the root of the image).
+    Only an image made by mkfs.erofs has them (the built-in uncompressed builder leaves them out)."""
+    def __init__(self, target):
+        self.target = target
+
+
 def write_tree(tree, root):
     """Materialise a system_tree() dict as real files (for mkfs.erofs)."""
     import os
@@ -82,6 +92,8 @@ def write_tree(tree, root):
         p = os.path.join(root, name)
         if isinstance(t, dict):
             write_tree(t, p)
+        elif isinstance(t, Symlink):
+            os.symlink(t.target, p)
         else:
             open(p, "wb").write(t)
 
@@ -102,7 +114,14 @@ def system_tree():
         "etc": {"os-release": b"NAME=Metallium-OS\nVERSION=0.1\n"},
         "bin": {"blob.bin": bytes((i * 7) % 251 for i in range(9000))},
         # compressible: exercises the LZ4 path when the image is built with mkfs.erofs -zlz4hc
-        "usr": {"share": {"lorem.txt": LOREM}},
+        # dirtest: a directory of 420 entries, more names than one page of a listing holds (the test reads it in pieces)
+        # links: the cases the symbolic link tests (user/src/vfs.rs) go through; hop0 .. hop19 is a chain of 20 links to links/target.txt (more than a path may follow)
+        "usr": {"share": {"lorem.txt": LOREM, "dirtest": {f"entry-{i:04d}-with-a-longish-name": b"" for i in range(420)},
+                          "links": {"target.txt": b"link target\n", "sub": {"inner.txt": b"inner\n"},
+                                    "rel": Symlink("target.txt"), "abs": Symlink("/usr/share/links/target.txt"), "up": Symlink("../links/target.txt"),
+                                    "dirlink": Symlink("sub"), "dirabs": Symlink("/usr/share/links/sub"),
+                                    "loop1": Symlink("loop2"), "loop2": Symlink("loop1"), "dangling": Symlink("nowhere.txt"),
+                                    **{f"hop{i}": Symlink(f"hop{i + 1}" if i < 19 else "target.txt") for i in range(20)}}}},
     }
     tree["bin"].update(programs())
     import mkmap

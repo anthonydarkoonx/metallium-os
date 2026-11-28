@@ -303,6 +303,40 @@ pub fn call_cap(slot: u64, w: [u64; 3], give: Option<Give>, accept: bool) -> (i6
     (r[0] as i64, [r[1], r[2], r[3]], if r[0] as i64 == 0 && accept { received(r[4]) } else { Received::None })
 }
 
+pub const IPC_WAIT_ANY: u64 = 53;
+/// `E_TIMEDOUT`: a timed receive ran out.
+pub const E_TIMEDOUT: i64 = -9;
+
+/// `recv` that gives up after `timeout_us` microseconds (0: waits for ever): `Err(E_TIMEDOUT)` (-9) when nothing came.
+pub fn recv_timeout(slot: u64, timeout_us: u64) -> Result<Msg, i64> {
+    let r = svc(IPC_RECV, slot, 0, timeout_us, 0, 0);
+    if r[0] as i64 != 0 {
+        return Err(r[0] as i64);
+    }
+    Ok(Msg { sender: r[1], w: [r[2], r[3], r[4]], call: r[5] & 1 != 0 })
+}
+
+/// A message received from one of several endpoints.
+pub struct Any {
+    /// The slot of this program's table the message came from.
+    pub slot: u64,
+    pub msg: Msg,
+    /// What came with it, if the wait asked for capabilities.
+    pub cap: Received,
+}
+
+/// Wait for a message on any of the endpoints in the slots whose bits are set in `mask` (each must hold a receive capability): the first queued message, or the
+/// first to arrive. `timeout_us` 0 waits for ever, else `Err(E_TIMEDOUT)` after that long. With `nowait` it returns `Err(-10)` at once if nothing is queued. `accept`
+/// takes a capability that comes with the message (see `recv_cap`). Errors: `-3` another task waits on one of the endpoints, `-2` a receive capability was revoked,
+/// `-4` an endpoint ended.
+pub fn wait_any(mask: u32, accept: bool, nowait: bool, timeout_us: u64) -> Result<Any, i64> {
+    let r = svc(IPC_WAIT_ANY, mask as u64, nowait as u64 | if accept { RECV_ACCEPT } else { 0 }, timeout_us, 0, 0);
+    if r[0] as i64 != 0 {
+        return Err(r[0] as i64);
+    }
+    Ok(Any { slot: (r[5] >> 16 & 0xFF) - 1, msg: Msg { sender: r[1], w: [r[2], r[3], r[4]], call: r[5] & 1 != 0 }, cap: received(r[5] >> 8) })
+}
+
 /// `IPC_SEND` (no reply, not waited for) with a capability.
 pub fn send_cap(slot: u64, w: [u64; 3], give: Give) -> i64 {
     svc(IPC_SEND, slot, w[0], w[1], w[2], xfer(Some(give), false))[0] as i64

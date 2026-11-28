@@ -1101,6 +1101,41 @@ pub fn tests() {
     let t = Req::new().fs().args(b"ls\0/system\0").go(&ls);
     let code = if t > 0 { wait(t, false) } else { t };
     println!("[client] TEST a program lists a directory ({code} entries in /system): {}", verdict(code == 4));
+    let t = Req::new().fs().args(b"ls\0/system/usr/share/dirtest\0").go(&ls);
+    let code = if t > 0 { wait(t, false) } else { t };
+    println!("[client] TEST a program lists a directory of 420 entries, more than one page of names holds, with read_dir ({code} entries): {}", verdict(code == 420));
+    // ---- advisory file locks (V_LOCK) -------------------------------------------------------------------------------------------
+    // Like flock: shared or exclusive on an open file, converted by asking again, never waiting (EAGAIN), released by close and when the program that took it ends.
+    let lockprobe = load("lockprobe");
+    if lockprobe.len() >= 32 {
+        let path = "/data/lock.txt";
+        let _ = v.write_file(path, b"locked");
+        let (f1, f2) = (v.open(path, 1).unwrap_or(99), v.open(path, 1).unwrap_or(99));
+        let again = Err(crate::vfs::EAGAIN as i64);
+        let mut steps = [false; 12];
+        steps[0] = v.flock(f1, 2).is_ok();
+        steps[1] = v.flock(f2, 1) == again && v.flock(f2, 2) == again;
+        steps[2] = v.flock(f1, 3).is_ok() && v.flock(f2, 1).is_ok();
+        steps[3] = v.flock(f1, 1).is_ok(); // (two shared locks)
+        steps[4] = v.flock(f1, 2) == again; // (cannot be made exclusive while another open file shares it)
+        steps[5] = v.close(f2).is_ok() && v.flock(f1, 2).is_ok(); // (closing released the other's lock: now it converts)
+        steps[6] = v.flock(77, 1) == Err(crate::vfs::EBADF as i64) && v.flock(f1, 7) == Err(crate::vfs::EINVAL as i64);
+        println!("[client] TEST advisory locks on open files: exclusive excludes, shared share, a lock converts when asked again and is released by close ({steps:?}): {}", verdict(steps[..7].iter().all(|&b| b)));
+        let probe = |mode: &str| {
+            let args = alloc::format!("lockprobe\0{mode}\0{path}\0");
+            let t = Req::new().fs().args(args.as_bytes()).go(&lockprobe);
+            if t > 0 { wait(t, false) as i64 } else { t }
+        };
+        let (m1, m2) = (probe("1"), probe("2")); // (f1 holds an exclusive lock)
+        let unlocked = v.flock(f1, 3).is_ok();
+        let m4 = probe("4");
+        let m3 = probe("3"); // (takes the lock and ends with it)
+        let after = v.flock(f1, 2);
+        println!("[client] TEST a lock held by one program keeps another out (exclusive refused {m1}, shared refused {m2}), is granted when it is released ({unlocked} {m4}), and goes with the program that took it ({m3}, then {after:?}): {}",
+            verdict(m1 == 0 && m2 == 0 && unlocked && m4 == 0 && m3 == 0 && after.is_ok()));
+        let _ = v.close(f1);
+        let _ = v.unlink(path);
+    }
     let t = Req::new().fs().args(b"fdprobe\0open\0").go(&fdprobe);
     sleep(20);
     kill(t);
@@ -1153,6 +1188,25 @@ pub fn tests() {
     destroy(ep as i64);
     let code = if b > 0 { wait(b, false) } else { b };
     println!("[client] TEST a caller waiting on an endpoint that ends is told so instead of waiting for ever (exit code {code}: 1000 + 4): {}", verdict(code == 1004));
+    // ---- timed receive, receive on several endpoints ---------------------------------------------------------------------------
+    // IPC_RECV with a timeout and IPC_WAIT_ANY: a receive that gives up (-9), one that takes the first message to arrive on any of up to 32 endpoints and says which, with the
+    // races that brings (two senders on two endpoints at once; a wait that timed out or was served leaves registrations behind on the others; a call that arrives through it; an endpoint
+    // that ends) checked by waittest; then the same program is killed while it waits.
+    let waittest = load("waittest");
+    if waittest.len() >= 32 {
+        let (nodes0, frames0) = (sysinfo(1)[5], sysinfo(0)[3]);
+        let t = Req::new().arg(0).heap(200).threads(4).give_masked(1, FACTORY_SLOT as u8, 0xFFFF & !4).go(&waittest);
+        let code = if t > 0 { wait(t, false) as u64 } else { 0xFFFF };
+        println!("[client] TEST a receive can time out, and a receive on several endpoints names the one that got the message, loses none and refuses none, with senders racing, calls, stale registrations and endpoints that end (failure bits {code:#x}): {}", verdict(code == 0));
+        let t = Req::new().arg(1).heap(200).threads(2).give_masked(1, FACTORY_SLOT as u8, 0xFFFF & !4).go(&waittest);
+        sleep(10);
+        let k = if t > 0 { kill(t) } else { t };
+        let code2 = if t > 0 { wait(t, false) as u64 } else { 0 };
+        sleep(3);
+        let (nodes1, frames1) = (sysinfo(1)[5], sysinfo(0)[3]);
+        println!("[client] TEST a program killed while it waits on several endpoints (and a thread in a timed receive) ends cleanly and everything comes back (kill {k}, code {code2:#x}, nodes {nodes0} -> {nodes1}, frames {frames0} -> {frames1}): {}", verdict(k == 0 && code2 == EXIT_KILLED && nodes1 == nodes0 && frames1 + 8 >= frames0));
+    }
+
     // ---- capabilities in messages -------------------------------------------------------------------------------------------
     // Two programs that are siblings (so CAP_GRANT between them is refused) share memory by sending capabilities through an endpoint: with the rights narrowed on the
     // way, back in a reply, only to a receiver that asked, revoked with its source, refused when the receiver's table is full or the capability was revoked in the queue.

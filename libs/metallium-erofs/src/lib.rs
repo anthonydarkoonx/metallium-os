@@ -36,6 +36,9 @@ const LAYOUT_COMPRESSED_COMPACT: u8 = 3;
 pub const S_IFMT: u16 = 0o170000;
 pub const S_IFDIR: u16 = 0o040000;
 pub const S_IFREG: u16 = 0o100000;
+pub const S_IFLNK: u16 = 0o120000;
+/// Most symbolic links `Erofs::resolve` follows in one path (a longer chain, or a loop, is `Error::TooManyLinks`).
+pub const MAX_LINKS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -45,6 +48,10 @@ pub enum Error {
     Corrupt,
     NotFound,
     NotDir,
+    /// More than `MAX_LINKS` symbolic links met while resolving a path (a loop, or a very long chain).
+    TooManyLinks,
+    /// `readlink` of something that is not a symbolic link.
+    NotLink,
 }
 
 /// Backing storage (flash partition, RAM image, ...).
@@ -78,6 +85,9 @@ impl Inode {
     }
     pub fn is_file(&self) -> bool {
         self.mode & S_IFMT == S_IFREG
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
     }
 }
 
@@ -247,6 +257,66 @@ impl<S: Source> Erofs<S> {
             cur = self.lookup_in(&cur, part.as_bytes())?;
         }
         Ok(cur)
+    }
+
+    /// The target of the symbolic link `ino`, into `buf` (a longer one is cut): the number of bytes.
+    pub fn readlink(&self, ino: &Inode, buf: &mut [u8]) -> Result<usize, Error> {
+        if !ino.is_symlink() {
+            return Err(Error::NotLink);
+        }
+        let n = (ino.size as usize).min(buf.len());
+        self.read(ino, 0, &mut buf[..n])
+    }
+
+    /// Resolve a path, following symbolic links in every component and, with `follow_last`, in the last one too (`false`: the link itself is the answer, as
+    /// for `lstat`). A target is relative to the directory the link is in; an absolute one starts at the root of this image. `..` of the root is the root. At
+    /// most `MAX_LINKS` links are followed in all, so a loop ends in `Error::TooManyLinks`.
+    pub fn resolve(&self, path: &str, follow_last: bool) -> Result<Inode, Error> {
+        extern crate alloc;
+        use alloc::vec::Vec;
+        let split = |p: &[u8], todo: &mut Vec<Vec<u8>>| {
+            // (pushed last to first, so the first component is on top)
+            for part in p.split(|&c| c == b'/').rev().filter(|c| !c.is_empty() && *c != b".") {
+                todo.push(part.to_vec());
+            }
+        };
+        let mut dirs: Vec<Inode> = Vec::new();
+        dirs.push(self.root()?);
+        let mut todo: Vec<Vec<u8>> = Vec::new();
+        split(path.as_bytes(), &mut todo);
+        let mut links = 0;
+        while let Some(part) = todo.pop() {
+            if part == b".." {
+                if dirs.len() > 1 {
+                    dirs.pop();
+                }
+                continue;
+            }
+            let cur = *dirs.last().ok_or(Error::Corrupt)?;
+            let ino = self.lookup_in(&cur, &part)?;
+            let last = todo.is_empty();
+            if ino.is_symlink() && (!last || follow_last) {
+                links += 1;
+                if links > MAX_LINKS {
+                    return Err(Error::TooManyLinks);
+                }
+                let mut target = alloc::vec![0u8; (ino.size as usize).min(4096)];
+                let n = self.readlink(&ino, &mut target)?;
+                if target.first() == Some(&b'/') {
+                    dirs.truncate(1);
+                }
+                split(&target[..n], &mut todo);
+                continue;
+            }
+            if last {
+                return Ok(ino);
+            }
+            if !ino.is_dir() {
+                return Err(Error::NotDir);
+            }
+            dirs.push(ino);
+        }
+        dirs.last().copied().ok_or(Error::Corrupt)
     }
 }
 

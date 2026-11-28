@@ -66,6 +66,8 @@ fn encode(s: State) -> u64 {
         State::ChildWait(c) => 8 | (c as u64) << 8,
         State::Embryo => 9,
         State::WordWait(d) => 10 | d << 8,
+        State::MultiWait(t) => 11 | (t as u64) << 8,
+        State::MultiClaimed => 12,
     }
 }
 
@@ -81,6 +83,8 @@ fn decode(v: u64) -> State {
         8 => State::ChildWait((v >> 8) as u16),
         9 => State::Embryo,
         10 => State::WordWait(v >> 8),
+        11 => State::MultiWait((v >> 8) as u32),
+        12 => State::MultiClaimed,
         _ => State::Dead,
     }
 }
@@ -189,9 +193,27 @@ pub fn doom(tid: usize, why: Doom) {
     DOOM_WHY[tid].store(why as u8, Ordering::SeqCst);
     DOOMED[tid].store(true, Ordering::SeqCst);
     let s = state(tid);
-    if matches!(s, State::RecvWait(_) | State::CallWait | State::Sleep(_) | State::IrqWait(_) | State::RingWait(_) | State::ChildWait(_) | State::Embryo | State::WordWait(_)) {
+    if matches!(s, State::RecvWait(_) | State::MultiWait(_) | State::CallWait | State::Sleep(_) | State::IrqWait(_) | State::RingWait(_) | State::ChildWait(_) | State::Embryo | State::WordWait(_)) {
         let _ = wake_if(tid, s);
     }
+}
+
+/// The deadline of a timed receive (`IPC_RECV`, `IPC_WAIT_ANY`; 0 = none), kept in the same per-task cell as `IRQ_WAIT`'s: a task waits for one
+/// thing at a time. Set before the task's state says it is waiting. Untimed waits (almost all of them) do not write the cell if it is clear already.
+pub fn set_wait_deadline(tid: usize, deadline: u64) {
+    if deadline != 0 || IRQ_DEADLINE[tid].load(Ordering::Relaxed) != 0 {
+        set_irq_deadline(tid, deadline);
+    }
+}
+
+/// `tid` is in `MultiWait(tok)`: take it, so that nobody else can deliver to it or time it out; true for the one caller that gets it. The claimant
+/// writes the task's result registers and then makes it `Ready` with `wake_if(tid, State::MultiClaimed)`.
+pub fn claim_multi(tid: usize, tok: u32) -> bool {
+    let ok = SLOT[tid].state.compare_exchange(encode(State::MultiWait(tok)), encode(State::MultiClaimed), Ordering::SeqCst, Ordering::Relaxed).is_ok();
+    if ok {
+        publish(tid);
+    }
+    ok
 }
 
 pub fn set_irq_deadline(tid: usize, deadline: u64) {
@@ -293,6 +315,7 @@ fn publish(tid: usize) {
             State::Ready => (true, false),
             State::Sleep(_) | State::IrqWait(_) => (false, true),
             State::WordWait(d) if d != 0 => (false, true),
+            State::RecvWait(_) | State::MultiWait(_) if IRQ_DEADLINE[tid].load(Ordering::SeqCst) != 0 => (false, true),
             _ => (false, false),
         };
         let live = ready || timed || matches!(s, State::RingWait(_));
@@ -313,7 +336,7 @@ fn publish(tid: usize) {
             State::WordWait(d) if d != 0 => {
                 NEXT_TIMED.fetch_min(d, Ordering::SeqCst);
             }
-            State::IrqWait(_) => {
+            State::IrqWait(_) | State::RecvWait(_) | State::MultiWait(_) => {
                 let d = IRQ_DEADLINE[tid].load(Ordering::SeqCst);
                 if d != 0 {
                     NEXT_TIMED.fetch_min(d, Ordering::SeqCst);
@@ -1121,6 +1144,22 @@ fn wake_sleepers(now: u64) {
                     next = next.min(d);
                 }
             }
+            State::RecvWait(e) => {
+                let d = IRQ_DEADLINE[i].load(Ordering::SeqCst);
+                if d != 0 && d <= now {
+                    crate::ipc::expire(i, e);
+                } else if d != 0 {
+                    next = next.min(d);
+                }
+            }
+            State::MultiWait(tok) => {
+                let d = IRQ_DEADLINE[i].load(Ordering::SeqCst);
+                if d != 0 && d <= now {
+                    crate::ipc::expire_multi(i, tok);
+                } else if d != 0 {
+                    next = next.min(d);
+                }
+            }
             _ => {}
         }
     }
@@ -1374,7 +1413,7 @@ fn quiet_until(online: u32) -> Option<u64> {
         match state(i) {
             State::Sleep(d) => at = at.min(d),
             State::WordWait(d) if d != 0 => at = at.min(d),
-            State::IrqWait(_) => {
+            State::IrqWait(_) | State::RecvWait(_) | State::MultiWait(_) => {
                 let d = IRQ_DEADLINE[i].load(Ordering::SeqCst);
                 if d != 0 {
                     at = at.min(d);
@@ -1621,7 +1660,7 @@ pub fn dispatch(tf: &mut TrapFrame, preempt: bool) {
         // than never.
         if cur != usize::MAX && DOOMED[cur].load(Ordering::SeqCst) {
             let s = state(cur);
-            if matches!(s, State::RecvWait(_) | State::CallWait | State::Sleep(_) | State::IrqWait(_) | State::RingWait(_)) {
+            if matches!(s, State::RecvWait(_) | State::MultiWait(_) | State::CallWait | State::Sleep(_) | State::IrqWait(_) | State::RingWait(_)) {
                 let _ = wake_if(cur, s);
             }
         }
