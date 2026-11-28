@@ -130,7 +130,7 @@ program!("quotatest", |c| {
         4 => {
             let mut kids: Vec<i64> = Vec::new();
             let mut err = 0i64;
-            for _ in 0..20 {
+            for _ in 0..40 {
                 let mut p = Spawn::new(SLEEPER);
                 p.heap_pages = 1;
                 let t = spawn(0, &p);

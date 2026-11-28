@@ -44,7 +44,7 @@ fn pattern(i: usize, k: usize) -> u8 {
 program!("shmtest", |c| {
     match c.arg {
         0 => {
-            if shm_create(0) != -5 || shm_create(4097) != -5 {
+            if shm_create(0) != -5 || shm_create(65537) != -5 {
                 return 1;
             }
             let held0 = quota().held;
@@ -89,7 +89,7 @@ program!("shmtest", |c| {
             }
             let mut ok = 0;
             let mut last = 0;
-            for i in 0..80 {
+            for i in 0..300 {
                 last = map(one as u64, BIG + 0x40_0000 + i * PAGE, true);
                 if last == 0 {
                     ok += 1;
@@ -97,7 +97,7 @@ program!("shmtest", |c| {
                     break;
                 }
             }
-            if ok < 40 || last != -8 {
+            if ok < 200 || last != -8 {
                 return 10;
             }
             // too little memory left under the limit is refused without side effects

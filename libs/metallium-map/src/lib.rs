@@ -22,13 +22,13 @@
 //! name       = Counter            # shown to the user
 //! version    = 1.0.0
 //! unsigned   = true               # phase 1: no signature check yet, the flag says so out loud
-//! heap_pages = 128                # memory limit, 1..=16384 (default 128)
-//! threads    = 0                  # extra threads, 0..=8
+//! heap_pages = 128                # memory limit, 1..=1048576 (default 128)
+//! threads    = 0                  # extra threads, 0..=64
 //! quota      = 12                 # files and directories the program may have in its own directory, 1..=1024 (default 12)
 //! class      = interactive        # interactive | background | heavy
 //! role = desktop                  # the desktop (taskbar, Start menu): the manager gives the compositor its role; implies shell
 //! permission = files              # files | network | display | shell | allfiles | admin | spawn (repeatable)
-//! spawn_pages = 4096               # with `spawn`: pages the program may hand down to the programs it starts (default 4096, max 16384)
+//! spawn_pages = 4096               # with `spawn`: pages the program may hand down to the programs it starts (default 4096, max 1048576)
 //! ability    = main ui bin/counter.pie     # name, kind (ui | service), entry file in the package
 //! ```
 //! A signed package is accepted if its key is in the system's trust store (`/system/etc/program-keys`, lines `name = <64 hex digits of
@@ -57,13 +57,13 @@ pub const MAX_MANIFEST: usize = 4096;
 pub const MAX_FILES: usize = 64;
 pub const MAX_ABILITIES: usize = 8;
 pub const MAX_ID: usize = 16;
-pub const MAX_HEAP_PAGES: u32 = 16384;
-pub const MAX_THREADS: u8 = 8;
+pub const MAX_HEAP_PAGES: u32 = 1 << 20;
+pub const MAX_THREADS: u8 = 64;
 pub const MAX_QUOTA: u16 = 1024;
 pub const DEFAULT_HEAP_PAGES: u32 = 128;
 /// What a program with `permission = spawn` may hand down to the programs it starts, unless `spawn_pages` says otherwise.
 pub const DEFAULT_SPAWN_PAGES: u32 = 4096;
-pub const MAX_SPAWN_PAGES: u32 = 16384;
+pub const MAX_SPAWN_PAGES: u32 = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

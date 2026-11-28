@@ -28,7 +28,7 @@ task (`CAP_GRANT`) or to a program it starts (the spawn request).
 | 2 | IPC_RECV | slot, nonblock: wait for a message → x1 sender task id, x2..x4 words, x5 = 1 if the sender is waiting for a reply. With `nonblock != 0` and nothing queued: `-10`. `-4`/`-2` if the endpoint ends or the capability is revoked while waiting |
 | 3 | IPC_CALL | slot, w0..w2: send and wait for the reply → x1..x3 reply words. `-4` if the server dies or the endpoint ends |
 | 8 | IPC_REPLY | w0..w2: answer the caller being served |
-| 4 | MEM_MAP | slot, va, writable: map a memory capability at `va` (4 KiB aligned, wholly inside 0x8020_0000..0x8040_0000 or inside the large window 0xA000_0000..0xC000_0000); at most 64 mappings per program. `va` = 0: the kernel chooses a random place (usual window for up to 128 pages, else the large one) with an unmapped page after the object and before the next mapping, and returns the address (explicit mappings return 0). If the window it tries first has no room it uses the other one; a program started with `FLAG_NO_FIXED_MAPS` (spawn flags bit 2) gets `-1` for any `va` but 0 |
+| 4 | MEM_MAP | slot, va, writable: map a memory capability at `va` (4 KiB aligned, wholly inside 0x8020_0000..0x8040_0000 or inside the large window 0xA000_0000..0xC000_0000); at most 256 mappings per program. `va` = 0: the kernel chooses a random place (usual window for up to 128 pages, else the large one, and if neither has room the `MMAP` arena below) with an unmapped page after the object and before the next mapping, and returns the address (explicit mappings return 0); a program started with `FLAG_NO_FIXED_MAPS` (spawn flags bit 2) gets `-1` for any `va` but 0 |
 | 5 | CAP_GRANT | slot, task id, rights mask, dest: give a copy to a running task; `dest` 0 = its first free slot, `dest` = n + 1 = slot n exactly (refused if that slot is in use). A *program* (anything started with `SPAWN`, as opposed to a boot-time service) may give only into its own program (its threads), into programs it started, and into the program that started it; any other target answers `-1`. A named slot (`dest` ≠ 0) is allowed only into a child, and a grant into another program never takes its last 4 free slots (`-8`). Boot-time services are not restricted. To share memory with an unrelated program, delegate it at `SPAWN` or route it through a common parent |
 | 6 | CAP_REVOKE | slot, flags: revoke what was derived from the capability; flag 1 also the capability itself (for an endpoint's creator: the endpoint ends; for run-time memory: it is freed, but only through the creator's capability: on a copy, such as a thread's, only the copy goes) |
 | 7 | YIELD | |
@@ -48,6 +48,9 @@ task (`CAP_GRANT`) or to a program it starts (the spawn request).
 | 46 | DEVICE_SECRET | → 0 and 32 bytes in `x1`..`x4`: the machine's own secret (only the data store server, role 6; `E_PERM` for anyone else, `E_NOSYS` if the machine has none): what opens an encrypted data volume without a passphrase (`docs/ENCRYPTION.md`) |
 | 47 | IPC_DEFER | → token (the caller's id): park the synchronous call being served; the caller stays blocked and this task can `recv` again. `E_NOREPLY` if there is no such call |
 | 49 | ADD_ENTROPY | w0..w3: fold 32 bytes (four little-endian words) from an entropy device into the kernel's generator. Only the entropy driver (role 21) may (`E_PERM`); `E_NOSYS` when the generator takes no outside entropy (the layout debugging modes). A driver may call it again to reseed |
+| 50 | MMAP | addr, pages, prot \| flags → address: `pages` pages of anonymous zeroed memory in the arena 0x20_0000_0000..0x40_0000_0000 (128 GiB; position-independent images live below it). **Nothing is allocated until a page is first touched** (a load, store or instruction fetch faults it in, zero filled; the kernel does the same for a system call that reads or writes the page): a large reservation costs address space (at most 1 048 576 pages = 4 GiB per program, else `-8`) and page-table entries, and each page touched counts against the memory limit like heap (a program that touches past its limit is ended like any bad access). `prot` (low byte) is `PROT_READ` 1, `PROT_WRITE` 2, `PROT_EXEC` 4 or 0 (a reservation nothing may touch); **write and execute together are refused (`-1`)**. Without `MAP_FIXED` (flags bit 8) the kernel chooses the place (`addr` is ignored): the first is random, the next follow it, each with an unmapped guard page after it. With `MAP_FIXED` the range must lie in the arena; pages that are an earlier `MMAP`'s are replaced (zeroed), free ones are made if the program may name addresses (not started with `FLAG_NO_FIXED_MAPS`, else `-1`), anything else mapped there is `-5` |
+| 51 | MUNMAP | addr, pages: free the `MMAP` pages in the range (frames, swapped-out pages and untouched reservations; holes are fine; the frames go back after a TLB flush on every core). A range that holds anything that is not `MMAP` memory (the heap, a stack, shared memory) is `-5` and nothing changes |
+| 52 | MPROTECT | addr, pages, prot: change the protection of `MMAP` pages, all of which must exist (`-5`); write+execute is `-1`. A page that becomes executable has the data cache cleaned and the instruction caches of every core invalidated first, so code written before the call (JIT, a dynamic linker's relocations) runs; write permission can be taken away and given back, and the page made executable again after changing it |
 | 48 | IPC_REPLY_TO | token, w0..w2: answer a caller parked by `IPC_DEFER` (`E_NOREPLY` if it is gone or was not parked by this task) |
 | 21 | SYSINFO | page, arg → facts (pages 10, 11, 13 and 14, which show what other tasks hold, answer `-1` unless the caller holds an `Admin` capability; pages 0..20 (20: why the machine has no IOMMU, up to 32 bytes in `x1`..`x4`; 18: the number of file and network sessions, and of task slots; 19: the display's and the storage's names, 16 bytes each, NUL padded, in `x1`,`x2` and `x3`,`x4`): 0 memory, 1 tasks, 2 harness flags, 3 task table rows (`arg` = slot; `-5` past the last of the machine's task slots, 64 to 1024: one per MiB of RAM, or the fw_cfg file `opt/metallium/max-tasks`), 4 fuzz seed, 5 file sessions (page, generation, program, parent program or 0xFFFF), 6 network sessions, 7 pages held by a task's program, 8 the caller's own task id, 9 the caller's layout: heap start, stack top, whether randomisation is on, whether the CPU has hardware random numbers, 10 one capability slot of a task (`arg` = task \| slot << 16; any task): kind, object, rights, node; 11 who holds a capability to an object (`arg` = kind \| object << 8 \| window << 24, the object in 16 bits): bit masks of the tasks of one window (bit t is task `window * 64 + t`; all holders, may send / write, may receive / map), the creator or 0xFFFF, how many capabilities name it in all windows; 12 what the object is (`arg` as in 11): 16-byte name in `x1`,`x2`, size in pages or interrupt number, class, creator or 0xFFFF; 13 what revoking a capability would take with it (`arg` = task \| slot << 16 \| window << 24): how many other capabilities derive from it, the tasks of that window holding them (bit mask), how many capability nodes hang under it, 1 if it is the root capability of its object (`REVOKE_OF` refuses those); 14 what has been revoked from a task and can be given back (`arg` = task \| n << 16, oldest first): id, slot, kind, object, rights \| 1 << 16 if what it hung under is still there) |
 | 23 | SCHED | op…: real-time reservations (`R_RT`), statistics |
@@ -65,8 +68,8 @@ task (`CAP_GRANT`) or to a program it starts (the spawn request).
 | 36 | QUOTA | op 0: the caller's program's memory limits → limit (pages it may hold: heap + contiguous), `x1` held, `x2` budget, `x3` budget handed down so far, `x4` programs it has (zombies included). Op 1, child, heap pages (1..=4096), budget pages: change a child's limits (see Memory limits) |
 | 38 | SHM_INFO | memory capability slot (map right) → pages of the shared object it names, plus `1 << 32` if its creator has gone and `1 << 33` if the slot holds the creator's capability and no copy is held any more |
 | 39 | TASK_BASE | embryo's task id → the address its image area starts at: `0x8000_0000`, or a random page in `0x2_0000_0000..0x40_0000_0000` (about 26 bits of choice) if it was spawned with flags bit 3 (position-independent; the loader relocates the image to that base before `TASK_LOAD`) |
-| 37 | SHM_CREATE | pages (1..=4096) → slot of a new memory capability (map, write, grant) for fresh zeroed memory that can be shared with other programs (see Shared memory) |
-| 27 | EP_CREATE | factory capability slot → slot of a new endpoint capability (send+receive+grant); at most 4 per program, 16 in the system |
+| 37 | SHM_CREATE | pages (1..=65536) → slot of a new memory capability (map, write, grant) for fresh zeroed memory that can be shared with other programs (see Shared memory) |
+| 27 | EP_CREATE | factory capability slot → slot of a new endpoint capability (send+receive+grant); at most 16 per program (the table has 16 for every task slot) |
 
 ## Programs
 The kernel knows no executable format. `SPAWN` makes an embryo, the parent fills the image area (0x8000_0000 up to the
@@ -94,7 +97,7 @@ multiples of 4096 — and 8 bytes of name), code from the first byte after it (t
 | 8 | `u32` budget pages: what the program may hand down to programs of its own (0 = nothing, max 2^20) |
 | 12, 16 | reserved, zero (version 1 had the image here; non-zero is refused) |
 | 24 | `u32` class: 0 interactive, 1 background, 2 heavy |
-| 28 | `u32` heap pages (0 = 256, max 4096) |
+| 28 | `u32` heap pages (0 = 256, max 1 048 576) |
 | 32 | `u64` argument → the program's `x1` |
 | 40, 48 | `u64` argument block address, length (≤ 1024) |
 | 56 | 8 bytes name (zero: the loader uses the image's; "elf" for ELF files) |
@@ -128,8 +131,8 @@ Every task has two limits: a **holding limit** (the heap quota: pages it may hol
 `heap + budget + 24` pages of budget (24 = stack and page tables), and every page loaded into it with `TASK_LOAD` one more;
 the cost is returned when the program dies, once. The kernel refuses a spawn that does not fit (`-8`, no memory), so a tree
 of programs can never hold more than the budget of its root, whatever any of them does. The boot-time tasks have fixed
-budgets (the conductor 30 000 pages, the others 8 192); a program starts with the budget its parent gave it, which is 0 by
-default. A program may have at most 8 programs at a time (64 for the boot-time tasks); zombies and unstarted embryos
+budgets (the conductor 30 000 pages, the others 262 144); a program starts with the budget its parent gave it, which is 0 by
+default. A program may have at most 32 programs at a time (a boot-time task as many as there are task slots, at least 64); zombies and unstarted embryos
 count, `-3` when it is reached. A parent changes a child's limits with `QUOTA` op 1: the change is charged to or
 refunded to its own budget, and refused (`-5`) below what the child holds or has handed down, or (`-8`) beyond the
 parent's budget. Allocation past a limit returns `-8` to the program that asked; nothing else is affected.
@@ -162,16 +165,16 @@ it is held any more: the creator can tell that its partners are gone.
 except slot 15, which holds the console. There are 1024 capability nodes in the system (a node is one capability and the
 copies derived from it).
 
-**Per-program limits on shared tables.** A program (its threads together) may hold at most 32 run-time memory objects
-(`SHM_CREATE`, `MC_ALLOC`), at most 192 capability nodes it made for itself (its own memory and endpoints, its threads' copies, what it
-gives the programs it starts), and at most 4 run-time endpoints; with all its threads it may have at most 4 of the 8 messages queued at one endpoint (`IPC_SEND` answers `-3` beyond that) and may hold 5 of the file-system and 5 of the network sessions (a quarter of the task slots each, 8 to 255; SYSINFO 18 gives the number) for the programs it starts (`SPAWN` answers `E_FULL`). Programs also never take the last 16 object-table entries, the last 48
+**Per-program limits on shared tables.** A program (its threads together) may hold at most 256 run-time memory objects
+(`SHM_CREATE`, `MC_ALLOC`), at most 768 capability nodes it made for itself (its own memory and endpoints, its threads' copies, what it
+gives the programs it starts), and at most 16 run-time endpoints; with all its threads it may have at most 4 of the 8 messages queued at one endpoint (`IPC_SEND` answers `-3` beyond that) and may hold 5 of the file-system and 5 of the network sessions (a quarter of the task slots each, 8 to 255; SYSINFO 18 gives the number) for the programs it starts (`SPAWN` answers `E_FULL`). Programs also never take the last 16 object-table entries, the last 48
 capability nodes or the last 4 endpoints: those stay for boot-time services. Over a limit the call fails as if the table were full
 (`-3`, `E_FULL` or `E_NOMEM` as before). What a thread creates is its own: it goes when the thread ends, so a program that wants memory or
 endpoints to outlive its threads makes them in the first thread.
 
 ## Threads
 A *thread* is a task that runs in another task's address space. `SPAWN` request `flags` bits 8..11 give a program an
-allowance of 0..8 threads at once (default 0; the parent decides). `THREAD_CREATE(entry, stack top, arg, mask)` starts a
+allowance of 0..64 threads at once (spawn flags bits 8..14) (default 0; the parent decides). `THREAD_CREATE(entry, stack top, arg, mask)` starts a
 thread at `entry` with `x0 = arg`, `sp = stack top` (16-byte aligned; the program provides the stack, for example from
 its heap) and, for every bit `i` of `mask`, a copy of the creator's capability in slot `i` (same rights, a new node
 derived from the original, so revoking the original takes it back) plus the console.

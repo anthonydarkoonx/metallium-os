@@ -221,6 +221,28 @@ fn bring_in(tid: usize, l1: usize, va: usize) -> Back {
     Back::Ok
 }
 
+/// First touch of a page reserved by `MMAP` (the task's lock is held by the caller): allocate a zeroed frame, map it with the reserved
+/// protection and count it against the program's memory limit. `write`/`exec` say what the access is; an access the reservation does not allow
+/// is `Back::Corrupt` (the caller kills the program or fails the system call), as is going over the limit.
+fn populate(tid: usize, t: &task::Task, va: usize, prot: u8, write: bool, exec: bool) -> Back {
+    use mmu::{PROT_R, PROT_W, PROT_X};
+    let allowed = if exec { prot & PROT_X != 0 } else if write { prot & PROT_W != 0 } else { prot & (PROT_R | PROT_W | PROT_X) != 0 };
+    if !allowed {
+        return Back::Corrupt;
+    }
+    let held = t.held_pages().saturating_add(crate::spawn::contig_pages(tid));
+    if held >= task::info(tid).heap_quota {
+        return Back::Corrupt; // (the program's limit: it dies of it, as a heap that cannot grow would be refused)
+    }
+    let Some(pa) = mem::alloc_movable(mem::OWNER_TASK0 + tid as u16, tid, va) else { return Back::NoMemory };
+    if !mmu::populate_lazy(t.l1, va, pa) {
+        mem::free(pa);
+        return Back::Corrupt;
+    }
+    t.anon_pages.fetch_add(1, Ordering::Relaxed);
+    Back::Ok
+}
+
 /// What a fault means to the swap system.
 pub enum Fault {
     /// Not about swap or aging.
@@ -264,6 +286,14 @@ pub fn handle_fault(tid: usize, ec: u64, esr: u64, far: usize) -> Fault {
                     return Fault::Retry;
                 }
                 Page::Absent => return Fault::Other,
+                Page::Lazy(prot) => {
+                    // data abort: the write bit says whether it was a store (ISS.WnR); instruction abort: a fetch
+                    match populate(tid, &t, va, prot, ec == 0x24 && esr & (1 << 6) != 0, ec == 0x20) {
+                        Back::Ok => return Fault::Retry,
+                        Back::Corrupt => return Fault::Other, // not allowed by the reservation (or over the limit): the program dies as for any bad access
+                        Back::NoMemory => {}
+                    }
+                }
                 Page::Swapped(_) => match bring_in(tid, t.l1, va) {
                     Back::Ok => return Fault::Retry,
                     Back::Corrupt => return Fault::Kill("swapped-out page lost"),
@@ -308,6 +338,7 @@ fn translate_for(t: &task::Task, tid: usize, va: usize, write: bool) -> Option<u
     }
     let page = va & !(PAGE - 1);
     match mmu::inspect(t.l1, page) {
+        Page::Lazy(prot) if populate(tid, t, page, prot, write, false) == Back::Ok => return walk(va), // (untouched `MMAP` memory the kernel is asked to read or fill)
         Page::Swapped(_) if bring_in(tid, t.l1, page) == Back::Ok => return walk(va),
         Page::Disk(slot) => {
             // the caller fails; a system call on the list in `syscall::handle` is run again when the page is back
@@ -327,10 +358,18 @@ fn translate_for(t: &task::Task, tid: usize, va: usize, write: bool) -> Option<u
 /// running a thread of the same program may still hold a translation for it, and a frame freed too early can be handed to
 /// another program while that thread can still read and write it. Frames are collected in batches.
 pub fn release_pages(l1: usize, first: usize, count: usize) -> usize {
+    release_range(l1, first, count, false).1
+}
+
+/// `release_pages` for any range, optionally only the pages of `MMAP` regions (`anon_only`; the others are left alone), and reserved pages that were
+/// never touched are forgotten too. Returns (pages that were something: a frame, a store entry, a disk slot or a reservation, and how many of
+/// those held a frame, a store entry or a disk slot).
+pub fn release_range(l1: usize, first: usize, count: usize, anon_only: bool) -> (usize, usize) {
     const BATCH: usize = 64;
     let mut pending = [0usize; BATCH];
     let mut n = 0;
     let mut released = 0;
+    let mut entries = 0;
     let drain = |pending: &[usize]| {
         if !pending.is_empty() {
             mmu::flush_tlb(); // no core can reach these frames any more
@@ -341,12 +380,16 @@ pub fn release_pages(l1: usize, first: usize, count: usize) -> usize {
     };
     for p in 0..count {
         let va = first + p * PAGE;
+        if anon_only && mmu::is_anon(l1, va) != Some(true) {
+            continue;
+        }
         match mmu::inspect(l1, va) {
             Page::Resident { pa, .. } => {
                 mmu::unmap_user(l1, va);
                 pending[n] = pa;
                 n += 1;
                 released += 1;
+                entries += 1;
                 if n == BATCH {
                     drain(&pending[..n]);
                     n = 0;
@@ -362,13 +405,18 @@ pub fn release_pages(l1: usize, first: usize, count: usize) -> usize {
                     }
                 }
                 released += 1;
+                entries += 1;
+            }
+            Page::Lazy(_) => {
+                mmu::clear_lazy(l1, va);
+                entries += 1;
             }
             Page::Absent => {}
         }
     }
     drain(&pending[..n]);
     mmu::flush_tlb(); // (also covers the entries that were swapped out)
-    released
+    (entries, released)
 }
 
 /// A task is being torn down: its store entries go with its frames.

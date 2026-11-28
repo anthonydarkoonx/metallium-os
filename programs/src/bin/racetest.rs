@@ -347,7 +347,7 @@ fn m2(sibling: u64, parent: u64) -> u64 {
     bits
 }
 
-const T_COUNT: usize = 7;
+const T_COUNT: usize = 28; // (task slots: a 64 MiB machine has 36 for programs and their threads)
 static DONES: [AtomicU32; T_COUNT] = [const { AtomicU32::new(0) }; T_COUNT];
 static MADE: AtomicU32 = AtomicU32::new(0);
 /// How many threads have finished making things, and the signal for them to end (what a thread made goes with it when it ends).
@@ -889,9 +889,9 @@ program!("racetest", |c| {
             0
         }
         11 => tpidr(),
-        12 => m7(12, 32),
+        12 => m7(12, 256),
         13 => m7(13, 0),
-        14 => m7(14, 4),
+        14 => m7(14, 16),
         15 => queue_share(),
         16 => n1(),
         20 => n3(),

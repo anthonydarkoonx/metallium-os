@@ -14,7 +14,7 @@ single-byte corruption and every truncation of a package). `tools/mkmap.py` buil
 `programs/packages/<id>.manifest`; `make map-check` has the Rust parser check what the Python tool built.
 
 Manifest (`key = value`, `#` comments): `id` (1-16 of `a-z 0-9 _ - .`), `name`, `version`, `unsigned`, `heap_pages`
-(1-4096, default 128), `threads` (0-8), `quota` (1-1024: the files and directories the program's own directory may hold, default 12), `class` (interactive/background/heavy), `permission` (`files`, `network`,
+(1-1048576, default 128), `threads` (0-64), `quota` (1-1024: the files and directories the program's own directory may hold, default 12), `class` (interactive/background/heavy), `permission` (`files`, `network`,
 repeatable; `display` gives the program the display endpoint (slot 2; for a window system to use); `allfiles` gives the whole file system instead of the program's own directory (for programs that browse the whole disk); `shell` makes the program a shell client: the program manager gives it its control endpoint as slot 3; `spawn` lets the program start programs of its own, see *Starting programs* below), `spawn_pages` (with `spawn`: pages it may hand down to the programs it starts, 1-16384, default 4096), `ability = NAME ui|service bin/PROGRAM` (repeatable, up to 8).
 
 ## Signing and trust (`libs/metallium-ed25519`)
@@ -59,7 +59,7 @@ uses, so `Command::new("ls").spawn()` works in such a program as it is. The rule
   file access. Network for a child needs `network`.
 * **No grandchildren.** Neither capability carries the grant right, so the programs it starts cannot start programs of their own.
 * **They are its children.** It may `WAIT` for and `KILL` them, and they end when it ends (stopped, crashed or uninstalled).
-* A program may have at most 8 programs at a time (`docs/ABI.md`, *Memory limits*).
+* A program may have at most 32 programs at a time (`docs/ABI.md`, *Memory limits*).
 
 The OS console (role 13) is not a program and keeps its own spawn capability (slot 8). A desktop's shells should declare `spawn`
 rather than rely on that (`docs/DESKTOP-INTERFACE.md`).

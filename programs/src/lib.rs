@@ -110,7 +110,7 @@ pub fn quota() -> Quota {
     Quota { limit: r[0], held: r[1], budget: r[2], delegated: r[3], children: r[4] }
 }
 
-/// Change a child's limits: its own (`heap_pages`, 1..=16384) and what it may hand down (`budget_pages`). Charged to this
+/// Change a child's limits: its own (`heap_pages`, 1..=1048576) and what it may hand down (`budget_pages`). Charged to this
 /// program's budget; 0 or a negative error (not a child, below what it holds, over my budget).
 pub fn set_child_quota(child: u64, heap_pages: u32, budget_pages: u32) -> i64 {
     svc(QUOTA, 1, child, heap_pages as u64, budget_pages as u64, 0)[0] as i64
@@ -119,6 +119,33 @@ pub fn set_child_quota(child: u64, heap_pages: u32, budget_pages: u32) -> i64 {
 /// Grow the heap by `pages`; the base address, or the error (negative).
 pub fn heap_grow(pages: u64) -> i64 {
     svc(HEAP_GROW, pages, 0, 0, 0, 0)[0] as i64
+}
+
+pub const MMAP: u64 = 50;
+pub const MUNMAP: u64 = 51;
+pub const MPROTECT: u64 = 52;
+/// Protections for `mmap` and `mprotect` (write and execute never together).
+pub const PROT_NONE: u64 = 0;
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_EXEC: u64 = 4;
+/// `mmap` flag: use the address given (inside the arena) instead of choosing one.
+pub const MAP_FIXED: u64 = 1 << 8;
+
+/// `pages` pages of anonymous zeroed memory, allocated when first touched and counted against this program's memory limit then; the address, or the
+/// error (negative). `prot` is `PROT_*`, optionally with `MAP_FIXED` (see the kernel's `MMAP`).
+pub fn mmap(addr: u64, pages: u64, prot: u64) -> i64 {
+    svc(MMAP, addr, pages, prot, 0, 0)[0] as i64
+}
+
+/// Free the `mmap` pages in a range (holes are fine); 0 or a negative error.
+pub fn munmap(addr: u64, pages: u64) -> i64 {
+    svc(MUNMAP, addr, pages, 0, 0, 0)[0] as i64
+}
+
+/// Change the protection of `mmap` pages (all of them must exist); 0 or a negative error. A page made executable is ready to run what was written to it.
+pub fn mprotect(addr: u64, pages: u64, prot: u64) -> i64 {
+    svc(MPROTECT, addr, pages, prot, 0, 0)[0] as i64
 }
 
 /// What a program tells `spawn` about the program it starts (see the kernel's spawn.rs for the request layout).
@@ -131,7 +158,7 @@ pub struct Spawn<'a> {
     pub budget_pages: u32,
     pub class: u32,
     pub fs: bool,
-    /// How many threads besides itself the program may have at once (at most 8).
+    /// How many threads besides itself the program may have at once (at most 64).
     pub threads: u8,
     /// (slot of mine, rights mask) for the child's slots 0, 1, ...; `None` leaves a slot empty.
     pub give: [Option<(u8, u16)>; 8],
@@ -179,7 +206,7 @@ pub fn revoke_self(slot: u64) -> i64 {
 
 pub const SHM_CREATE: u64 = 37;
 
-/// Fresh zeroed memory (1..=4096 pages) that can be shared: the slot of a memory capability (map, write, grant), or a
+/// Fresh zeroed memory (1..=65536 pages) that can be shared: the slot of a memory capability (map, write, grant), or a
 /// negative error (`-5` bad size, `-8` over the memory limit, `-3` no free slot). It lives as long as that capability:
 /// grant it to other programs (or delegate it when starting them) to share it; `revoke_self` frees it for all of them.
 pub fn shm_create(pages: u64) -> i64 {

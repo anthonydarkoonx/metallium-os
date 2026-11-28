@@ -636,6 +636,20 @@ pub fn tests() {
         println!("[client] TEST eight programs keep their own FP/SIMD registers and FPCR across yields, sleeps and preemption, and see zeroes at first use (exit codes {codes:?}): {}", verdict(ts.iter().all(|&t| t > 0) && codes.iter().all(|&c| c == 0)));
     }
 
+    // ---- MMAP, MUNMAP, MPROTECT -------------------------------------------------------------------------------------
+    // Anonymous memory that is allocated when first touched (counted against the memory limit then), freed in pieces, and given protections: read, read+write,
+    // read+execute, none; write+execute never. mmaptest checks the arena, zero fill, lazy accounting, partial unmapping, MAP_FIXED, code written then run
+    // after MPROTECT (twice, so the instruction cache is made coherent each time), the kernel faulting in a page it is asked to read, and the limits; modes 1 to 5
+    // each end in a fault the kernel must cause.
+    let mm = load("mmaptest");
+    if mm.len() >= 32 {
+        let (code, out, _) = run_with_console3(Req::new().arg(0).heap(512), &mm, b"");
+        let out = String::from_utf8_lossy(&out).into_owned();
+        println!("[client] TEST MMAP: lazy zeroed memory, partial MUNMAP, MAP_FIXED, W^X, code made executable by MPROTECT, kernel faults in untouched pages, reservation limits (failures {code}{}): {}", if out.is_empty() { String::new() } else { alloc::format!(", {}", out.trim()) }, verdict(code == 0));
+        let faults: Vec<u64> = [1u64, 2, 3, 4, 5].iter().map(|&m| run_with_console3(Req::new().arg(m).heap(64), &mm, b"").0 as u64).collect();
+        println!("[client] TEST a touch of PROT_NONE memory, a store to read-only memory, a jump into non-executable memory, a touch after MUNMAP and going over the memory limit by touching all end the program with a fault (codes {faults:x?}): {}", verdict(faults.iter().all(|&c| c == EXIT_FAULTED)));
+    }
+
     // ---- faults --------------------------------------------------------------------------------------------------
     let t = Req::new().arg(0).go(&crash);
     let code = if t > 0 { wait(t, false) as u64 } else { 0 };
@@ -819,9 +833,9 @@ pub fn tests() {
         let (c11, _, _) = run_with_console3(Req::new().arg(11).heap(64).threads(1), &race, b"");
         println!("[client] TEST a SIMD instruction in a user program runs ({c10:#x}, survived {}), and TPIDR_EL0 is not shared between tasks (bits {c11:#x}): {}", o10.contains("survived"), verdict(c10 == 0 && o10.contains("survived") && c11 == 0));
         // M7: a program's share of the global tables (memory objects, capability nodes, endpoints) is limited, however many threads it has
-        let q12 = run_with_console3(Req::new().arg(12).heap(400).threads(7), &race, b"").0;
-        let q13 = run_with_console3(Req::new().arg(13).heap(400).threads(7), &race, b"").0;
-        let q14 = run_with_console3(Req::new().arg(14).heap(200).threads(7).give_masked(1, FACTORY_SLOT as u8, 0xFFFF & !4), &race, b"").0;
+        let q12 = run_with_console3(Req::new().arg(12).heap(1000).threads(28), &race, b"").0;
+        let q13 = run_with_console3(Req::new().arg(13).heap(1000).threads(28), &race, b"").0;
+        let q14 = run_with_console3(Req::new().arg(14).heap(1000).threads(28).give_masked(1, FACTORY_SLOT as u8, 0xFFFF & !4), &race, b"").0;
         let q15 = run_with_console3(Req::new().arg(15).heap(64).threads(1).give_masked(1, FACTORY_SLOT as u8, 0xFFFF & !4), &race, b"").0;
         // ... and more than its share of the file-system sessions for the programs it starts (5 of 8; the last 2 are the boot-time tasks')
         let t = Req::new().arg(2).budget(3000).give(&[SPAWN_SLOT as u8]).go(&spawner);
@@ -908,11 +922,11 @@ pub fn tests() {
         let packed = if t > 0 { wait(t, false) as u64 } else { 0 };
         let (count, err) = (packed & 0xFF, (packed >> 8) as i64);
         println!("[client] TEST a program with a budget of 700 pages starts two default programs and the third is refused for memory, then gets the budget back (started {count}, error -{err}, code {packed:#x}): {}", verdict(count == 2 && err == 8));
-        // at most 8 programs at a time, however small
+        // at most 32 programs at a time, however small
         let t = Req::new().arg(4).heap(300).budget(4000).give(&[SPAWN_SLOT as u8]).go(&quotatest);
         let packed = if t > 0 { wait(t, false) as u64 } else { 0 };
         let (count, err) = (packed & 0xFF, (packed >> 8) as i64);
-        println!("[client] TEST a program may have at most 8 programs at a time, however much budget it has (started {count}, error -{err}): {}", verdict(count == 8 && err == 3));
+        println!("[client] TEST a program may have at most 32 programs at a time, however much budget it has (started {count}, error -{err}): {}", verdict(count == 32 && err == 3));
         // the kernel's side: the cost of a program is charged to its parent's budget, with each loaded page, and refunded when it dies
         let own = q(0, 0, 0, 0);
         let (d0, children0) = (own[3], own[4]);
@@ -934,7 +948,7 @@ pub fn tests() {
         sleep(10); // (it has grown its heap by 50 pages)
         let base = q(0, 0, 0, 0)[3];
         let below = q(1, t, 10, 0)[0] as i64;
-        let too_big = q(1, t, 16385, 0)[0] as i64;
+        let too_big = q(1, t, (1 << 20) + 1, 0)[0] as i64;
         let huge_budget = q(1, t, 100, 1 << 21)[0] as i64;
         let over_budget = q(1, t, 100, 100_000)[0] as i64;
         let up = q(1, t, 200, 100)[0] as i64;
@@ -1139,9 +1153,12 @@ pub fn tests() {
     destroy(ep as i64);
     let code = if b > 0 { wait(b, false) } else { b };
     println!("[client] TEST a caller waiting on an endpoint that ends is told so instead of waiting for ever (exit code {code}: 1000 + 4): {}", verdict(code == 1004));
-    let eps: Vec<i64> = (0..5).map(|_| mk()).collect();
+    // (a task may own 16 endpoints; the conductor's table of 32 capability slots has room for only some of them, so what stops it here is the table, `E_NOMEM`:
+    // the quota itself is checked with many threads of one program by racetest mode 14)
+    let eps: Vec<i64> = (0..17).map(|_| mk()).collect();
+    let made = eps.iter().filter(|&&e| e >= 0).count();
     let sixth = mk();
-    println!("[client] TEST a task may own four endpoints at a time ({:?}, then {sixth}): {}", eps, verdict(eps[..4].iter().all(|&e| e >= 0) && eps[4] == E_FULL as i64 && sixth == E_FULL as i64));
+    println!("[client] TEST a task can create endpoints until it has no capability slot (or 16) left, and is refused cleanly then ({made} made, then {sixth}): {}", verdict(made >= 5 && made <= 16 && (sixth == E_FULL as i64 || sixth == E_NOMEM as i64)));
     for &e in eps.iter().filter(|&&e| e >= 0) {
         destroy(e);
     }
@@ -1350,7 +1367,7 @@ pub fn tests() {
         println!("[client] TEST the thread allowance holds, and a place is free again once its thread has been joined (code {c}): {}", verdict(c == 0));
         let none = run(0, 0, false);
         println!("[client] TEST a program started without a thread allowance cannot start a thread (code {none}): {}", verdict(none == 1));
-        let wide = Req::new().arg(0).threads(9).go(&threads);
+        let wide = Req::new().arg(0).threads(100).go(&threads); // (the limit is 64; the field holds up to 127)
         println!("[client] TEST an allowance above the limit is refused ({wide}): {}", verdict(wide == E_INVAL as i64));
         let c = {
             let t = Req::new().arg(7).threads(2).fs().go(&threads);

@@ -101,6 +101,22 @@ pub const IPC_REPLY_TO: u64 = 48;
 /// (role 21, the virtio-rng driver) may (`E_PERM`); `E_NOSYS` when the generator takes no outside entropy (the layout debugging modes: every layout is meant to follow from
 /// the seed alone). Bytes that arrive make the generator strong enough for `GETRANDOM` even on a CPU without RNDR and with no seed file. A driver may call it again to reseed.
 pub const ADD_ENTROPY: u64 = 49;
+/// MMAP(addr, pages, prot | flags) -> address: `pages` pages of anonymous zeroed memory, private to the program, in the arena `task::MMAP_LO..MMAP_HI`.
+/// Nothing is allocated until a page is first touched (it then counts against the program's memory limit), so a large reservation costs only
+/// address space (at most `task::MAX_ANON_VIRT_PAGES` at a time) and page-table entries. `prot` (low byte): `PROT_R` 1, `PROT_W` 2, `PROT_X` 4, or 0 for a
+/// reservation nothing may touch; write and execute together are refused (`E_PERM`): code is made by writing a region and then `MPROTECT`ing it
+/// to read+execute. Without `MAP_FIXED` the kernel chooses the place (`addr` is ignored): the first at random, the next ones after it, each followed by an
+/// unmapped guard page. With `MAP_FIXED` (flags bit 8) the pages at `addr` (inside the arena) are replaced if they are an earlier `MMAP`'s, and made if nothing is
+/// there and the program may name addresses (`spawn::fixed_maps_allowed`), so a program that was started with `FLAG_NO_FIXED_MAPS` can re-map only
+/// inside what the kernel gave it (a dynamic linker laying its segments out in the space it reserved).
+pub const MMAP: u64 = 50;
+/// MUNMAP(addr, pages): free the `MMAP` pages in the range (frames, swapped pages and untouched reservations alike; holes are fine); anything in the
+/// range that is not an `MMAP` page is `E_INVAL`, and nothing is changed.
+pub const MUNMAP: u64 = 51;
+/// MPROTECT(addr, pages, prot): change the protection of `MMAP` pages, which must all exist (`E_INVAL`). Write+execute is `E_PERM`; a page that becomes
+/// executable has its instruction cache made coherent first, so code written before the call runs.
+pub const MPROTECT: u64 = 52;
+pub const MAP_FIXED: u64 = 1 << 8;
 pub const SC_RT_SET: u64 = 1;
 pub const SC_RT_WAIT: u64 = 2;
 pub const SC_RT_CLEAR: u64 = 3;
@@ -290,6 +306,9 @@ fn run(cur: usize) -> (u64, Out) {
         SHM_INFO => shm_info(cur, a1),
         TASK_BASE => Out::Ret(crate::spawn::task_base(cur, a1 as usize).map_or_else(|e| e, |b| b as i64)),
         HEAP_GROW => heap_grow(cur, a1 as usize),
+        MMAP => mmap(cur, a1 as usize, a2 as usize, a3),
+        MUNMAP => munmap(cur, a1 as usize, a2 as usize),
+        MPROTECT => mprotect(cur, a1 as usize, a2 as usize, a3),
         HEAP_RELEASE => heap_release(cur, a1 as usize, a2 as usize),
         MEMCTL => memctl(cur, a1, a2, a3, a4),
         RING_SETUP => Out::Ret(ring_setup(cur)),
@@ -410,7 +429,7 @@ fn ipc_recv(cur: usize, slot: u64, nonblock: bool) -> Out {
 
 /// Where `pages` pages can go in the mapping windows when the program does not say: a random page-aligned place with
 /// one unmapped page between it and every other mapping (and the window's edge). The usual window is tried first for
-/// objects up to `AUTO_SMALL_MAX` pages, then the large one.
+/// objects up to `AUTO_SMALL_MAX` pages, then the large one, then the arena of `MMAP`.
 const AUTO_SMALL_MAX: usize = 128;
 
 fn pick_map_address(t: &task::Task, pages: usize) -> Option<usize> {
@@ -438,6 +457,17 @@ fn pick_map_address(t: &task::Task, pages: usize) -> Option<usize> {
                 None if at + pages * mem::PAGE <= hi => return Some(at),
                 None => break,
                 Some(next) => at = next,
+            }
+        }
+    }
+    // The two windows are full (or the object is too big for them): the arena of `MMAP`, which is 128 GiB, with a free page on both sides.
+    let (lo, hi) = (task::MMAP_LO, task::MMAP_HI);
+    let need = (pages + 2) * mem::PAGE;
+    if need <= hi - lo {
+        for _ in 0..64 {
+            let va = lo + crate::rand::below((hi - lo - need) / mem::PAGE + 1) * mem::PAGE + mem::PAGE;
+            if mmu::range_free(t.l1, va - mem::PAGE, pages + 2) {
+                return Some(va);
             }
         }
     }
@@ -1201,6 +1231,155 @@ fn heap_release(cur: usize, first: usize, count: usize) -> Out {
     }
     let freed = crate::swap::release_pages(t.l1, t.heap_base + first * mem::PAGE, count);
     Out::Ret(freed as i64)
+}
+
+/// The range `addr..addr + pages * PAGE`, inside the `MMAP` arena and no bigger than a program may reserve; `None` if it is not.
+fn anon_range(addr: usize, pages: usize) -> Option<usize> {
+    if pages == 0 || pages > task::MAX_ANON_VIRT_PAGES || addr % mem::PAGE != 0 {
+        return None;
+    }
+    let end = addr.checked_add(pages * mem::PAGE)?;
+    (addr >= task::MMAP_LO && end <= task::MMAP_HI).then_some(end)
+}
+
+/// Where `pages` pages (and an unmapped guard page after them) go in the arena when the program does not say: after the last place handed out, or at
+/// random if that is taken or past the end.
+fn pick_anon_address(t: &mut task::Task, pages: usize) -> Option<usize> {
+    let (lo, hi) = (task::MMAP_LO, task::MMAP_HI);
+    let need = pages.checked_add(1)? * mem::PAGE;
+    if need > hi - lo {
+        return None;
+    }
+    if t.mmap_next == 0 {
+        t.mmap_next = lo + crate::rand::below((hi - lo) / 2 / mem::PAGE) * mem::PAGE; // (the first place is random: the arena's layout is not guessable)
+    }
+    let next = t.mmap_next;
+    if next >= lo && next + need <= hi && mmu::range_free(t.l1, next, pages + 1) {
+        t.mmap_next = next + need;
+        return Some(next);
+    }
+    for _ in 0..64 {
+        let va = lo + crate::rand::below((hi - lo - need) / mem::PAGE + 1) * mem::PAGE;
+        let before = if va > lo { va - mem::PAGE } else { va }; // (a free page before it too, so two regions never touch)
+        if mmu::range_free(t.l1, before, pages + 1 + (va - before) / mem::PAGE) {
+            t.mmap_next = va + need;
+            return Some(va);
+        }
+    }
+    None
+}
+
+fn mmap(cur: usize, addr: usize, pages: usize, a3: u64) -> Out {
+    let prot = (a3 & 0xFF) as u8;
+    let fixed = a3 & MAP_FIXED != 0;
+    if a3 & !(0xFF | MAP_FIXED) != 0 || prot & !7 != 0 || pages == 0 || pages > task::MAX_ANON_VIRT_PAGES {
+        return Out::Ret(E_INVAL);
+    }
+    if prot & mmu::PROT_W != 0 && prot & mmu::PROT_X != 0 {
+        return Out::Ret(E_PERM); // write xor execute
+    }
+    let space = task::aspace(cur); // (a thread maps into its program's address space)
+    let mut t = task::lock(space);
+    if t.l1 == 0 {
+        return Out::Ret(E_PERM);
+    }
+    let mut existing = 0usize; // reserved pages of an earlier MMAP that this one replaces
+    let va = if fixed {
+        if anon_range(addr, pages).is_none() {
+            return Out::Ret(E_INVAL);
+        }
+        if !mmu::range_free(t.l1, addr, pages) {
+            for p in 0..pages {
+                match mmu::is_anon(t.l1, addr + p * mem::PAGE) {
+                    Some(true) => existing += 1,
+                    Some(false) => return Out::Ret(E_INVAL), // (something else is mapped there: never replaced)
+                    None => {}
+                }
+            }
+        }
+        if existing < pages && !crate::spawn::fixed_maps_allowed(space) {
+            return Out::Ret(E_PERM); // this program asked to have its mappings placed by the kernel: it may only re-map what it was given
+        }
+        addr
+    } else {
+        match pick_anon_address(&mut t, pages) {
+            Some(v) => v,
+            None => return Out::Ret(E_NOMEM),
+        }
+    };
+    if t.anon_virt.load(core::sync::atomic::Ordering::Relaxed) - existing + pages > task::MAX_ANON_VIRT_PAGES {
+        return Out::Ret(E_NOMEM);
+    }
+    if existing > 0 {
+        let (entries, populated) = crate::swap::release_range(t.l1, va, pages, true);
+        t.anon_virt.fetch_sub(entries, core::sync::atomic::Ordering::Relaxed);
+        t.anon_pages.fetch_sub(populated, core::sync::atomic::Ordering::Relaxed);
+    }
+    let owner = mem::OWNER_TASK0 + space as u16;
+    for p in 0..pages {
+        if mmu::reserve_anon(t.l1, va + p * mem::PAGE, prot, owner).is_err() {
+            for q in 0..p {
+                mmu::clear_lazy(t.l1, va + q * mem::PAGE);
+            }
+            return Out::Ret(E_NOMEM); // (page tables for the range could not be made)
+        }
+    }
+    t.anon_virt.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+    Out::Ret(va as i64)
+}
+
+fn munmap(cur: usize, addr: usize, pages: usize) -> Out {
+    if anon_range(addr, pages).is_none() {
+        return Out::Ret(E_INVAL);
+    }
+    let space = task::aspace(cur);
+    let t = task::lock(space);
+    if t.l1 == 0 {
+        return Out::Ret(E_PERM);
+    }
+    if !mmu::range_free(t.l1, addr, pages) {
+        if (0..pages).any(|p| mmu::is_anon(t.l1, addr + p * mem::PAGE) == Some(false)) {
+            return Out::Ret(E_INVAL);
+        }
+        let (entries, populated) = crate::swap::release_range(t.l1, addr, pages, true);
+        t.anon_virt.fetch_sub(entries, core::sync::atomic::Ordering::Relaxed);
+        t.anon_pages.fetch_sub(populated, core::sync::atomic::Ordering::Relaxed);
+    }
+    Out::Ret(0)
+}
+
+fn mprotect(cur: usize, addr: usize, pages: usize, a3: u64) -> Out {
+    let prot = a3 as u8;
+    if a3 > 0xFF || prot & !7 != 0 || anon_range(addr, pages).is_none() {
+        return Out::Ret(E_INVAL);
+    }
+    if prot & mmu::PROT_W != 0 && prot & mmu::PROT_X != 0 {
+        return Out::Ret(E_PERM); // write xor execute
+    }
+    let space = task::aspace(cur);
+    let t = task::lock(space);
+    if t.l1 == 0 {
+        return Out::Ret(E_PERM);
+    }
+    if (0..pages).any(|p| mmu::is_anon(t.l1, addr + p * mem::PAGE) != Some(true)) {
+        return Out::Ret(E_INVAL); // (a hole, or something that is not MMAP memory: nothing is changed)
+    }
+    let mut made_code = false;
+    for p in 0..pages {
+        let va = addr + p * mem::PAGE;
+        if prot & mmu::PROT_X != 0 && matches!(mmu::inspect(t.l1, va), mmu::Page::Swapped(_) | mmu::Page::Disk(_)) {
+            crate::pager::cancel_write(t.l1, Some(va)); // (executable pages never go to the pager)
+        }
+        if let Some(Some(pa)) = mmu::set_prot(t.l1, va, prot) {
+            mmu::clean_dcache_pou(pa, mem::PAGE); // (code written through the data cache must reach the point where fetches look)
+            made_code = true;
+        }
+    }
+    mmu::flush_tlb(); // the new permissions apply on every core from here
+    if made_code {
+        mmu::flush_icache();
+    }
+    Out::Ret(0)
 }
 
 const MC_STATS: u64 = 0;

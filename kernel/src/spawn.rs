@@ -37,10 +37,10 @@ pub const EXIT_KILLED: u64 = u64::MAX - 1;
 pub const DELEG_NONE: u8 = 0xFF;
 const MAX_DELEG: usize = 8;
 /// Most heap a program may be given (pages), and what it gets by default.
-const MAX_HEAP: usize = 16384;
+const MAX_HEAP: usize = 1 << 20; // (4 GiB: the real limit is the parent's budget and the machine's memory)
 const DEFAULT_HEAP: usize = 256;
 /// Most programs one program may have at a time (zombies and embryos count), and the same for a boot-time task.
-const MAX_CHILDREN_PROGRAM: usize = 8;
+const MAX_CHILDREN_PROGRAM: usize = 32;
 /// A boot-time task (the shell, the program manager) is trusted with as many programs at once as there are slots (at least this many).
 const MAX_CHILDREN_ROLE: usize = 64;
 /// What every program costs its parent's budget on top of its heap quota and its own budget: its stack and page tables.
@@ -283,7 +283,7 @@ fn embryo_of(parent: usize, tid: usize) -> bool {
 /// | 8 | `budget_pages` u32: pages the program may hand down to programs of its own (0 = none; at most 2^20) |
 /// | 12, 16 | reserved, zero (version 1 had the image here) |
 /// | 24 | `class` u32: 0 interactive, 1 background, 2 heavy |
-/// | 28 | `heap_pages` u32 (0 = default 256, at most 16384) |
+/// | 28 | `heap_pages` u32 (0 = default 256, at most 1048576) |
 /// | 32 | `arg` u64: the program's x1 |
 /// | 40, 48 | `args_va`, `args_len` u64: bytes (at most 1024) copied to the top of the program's stack; x3 = their address, x4 = length |
 /// | 56 | `name` [u8; 8] (all zero: the name in the image header) |
@@ -332,9 +332,9 @@ pub fn fixed_maps_allowed(program: usize) -> bool {
 }
 pub const NET_EP_SLOT: usize = 10;
 pub const NET_PAGE_SLOT: usize = 11;
-/// Flags bits 8..11: how many threads (besides itself) the program may have at once.
+/// Flags bits 8..14: how many threads (besides itself) the program may have at once.
 const THREADS_SHIFT: u32 = 8;
-pub const MAX_THREADS: usize = 8;
+pub const MAX_THREADS: usize = 64;
 pub const MAX_ARGS: usize = 1024;
 /// Child slots of the file-system capabilities.
 pub const FS_EP_SLOT: usize = 8;
@@ -477,8 +477,8 @@ pub fn spawn(parent: usize, spawn_rights: Rights, req_va: usize) -> Result<usize
         return Err(E_INVAL);
     }
     let (arg, args_va, args_len) = (u64_at(32), u64_at(40) as usize, u64_at(48) as usize);
-    let threads = ((flags >> THREADS_SHIFT) & 0xF) as usize;
-    if flags & !(FLAG_FS | FLAG_NET | FLAG_NO_FIXED_MAPS | FLAG_PIE | 0xF << THREADS_SHIFT) != 0 || args_len > MAX_ARGS || threads > MAX_THREADS {
+    let threads = ((flags >> THREADS_SHIFT) & 0x7F) as usize;
+    if flags & !(FLAG_FS | FLAG_NET | FLAG_NO_FIXED_MAPS | FLAG_PIE | 0x7F << THREADS_SHIFT) != 0 || args_len > MAX_ARGS || threads > MAX_THREADS {
         return Err(E_INVAL);
     }
     if flags & FLAG_FS != 0 && spawn_rights & R_SPAWN_FS == 0 {
@@ -655,6 +655,7 @@ pub fn spawn(parent: usize, spawn_rights: Rights, req_va: usize) -> Result<usize
         let mut t = lock(tid);
         t.maps = [MapRec { used: false, va: 0, pages: 0, node: 0 }; task::MAX_MAPS];
         t.heap_pages = 0;
+        t.reset_anon();
         t.tstacks = [(0, 0, 0); MAX_THREADS];
         t.stack_top = stack_top;
         t.heap_base = heap_base;

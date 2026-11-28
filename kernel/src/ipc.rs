@@ -20,7 +20,7 @@ use crate::cap::NodeId;
 /// Endpoints 0..24 are the boot-time services'; the rest are created at run time (`EP_CREATE`, see below).
 pub const EP_FIRST_DYNAMIC: u16 = 25;
 /// The most endpoints a boot can have (lock ranks are reserved for this many); `nep()` is how many it does have.
-pub const MAX_EPS: usize = 4400;
+pub const MAX_EPS: usize = 16500;
 static NEP: AtomicUsize = AtomicUsize::new(0);
 
 pub fn nep() -> usize {
@@ -119,8 +119,8 @@ static EP_NODE: crate::table::Table<AtomicU16> = crate::table::Table::new();
 /// ... and the task that created it (for its quota).
 static EP_TASK: crate::table::Table<AtomicU16> = crate::table::Table::new();
 /// Most run-time endpoints one program (all its threads together) may own at a time, and the ones programs may never take.
-pub const MAX_OWNED_EPS: usize = 4;
-const EP_RESERVE: usize = 4;
+pub const MAX_OWNED_EPS: usize = 16;
+const EP_RESERVE: usize = 16;
 static CLAIM: SpinLock<()> = SpinLock::new(());
 
 /// The capability node that is the root of endpoint `e` (the creator's own capability), if it is in use.

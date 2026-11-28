@@ -142,7 +142,7 @@ kernel: user
 # Programs started with SPAWN (programs/): position-independent ELF files in programs/build (random image base each run; the
 # loader relocates them), packed into the system image under /bin. `sleeper` stays a flat image (the user crate embeds
 # it); the static `.elf` copies of argdump and hello exist to test the loader's fixed-address path.
-PROGRAM_BINS := fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
+PROGRAM_BINS := mmaptest fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
 PIE_FLAGS := -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro --cfg getrandom_backend=\"custom\"
 programs:
 	rm -rf programs/build; mkdir -p programs/build
@@ -289,7 +289,7 @@ qemu-test: kernel disk
 	 grep -q "TEST two clients use a server built on an endpoint.*PASS" build.log && \
 	 grep -q "TEST revoking the server's capability wakes it.*PASS" build.log && \
 	 grep -q "TEST a caller waiting on an endpoint that ends is told so.*PASS" build.log && \
-	 grep -q "TEST a task may own four endpoints at a time.*PASS" build.log && \
+	 grep -q "TEST a task can create endpoints until it has no capability slot.*PASS" build.log && \
 	 grep -q "TEST program packages in the system image install.*PASS" build.log && \
 	 grep -q "TEST a corrupt package, one whose id differs.*PASS" build.log && \
 	 grep -q "TEST signatures: an unsigned package, one signed by a key.*PASS" build.log && \
@@ -319,7 +319,10 @@ qemu-test: kernel disk
 	 grep -q "TEST a thread.s copy of run-time memory cannot free it.*PASS" build.log && \
 	 grep -q "TEST MC_FREE refuses a shared-memory capability.*PASS" build.log && \
 	 grep -q "TEST a program cannot put capabilities into a boot-time task.*PASS" build.log && \
-	 grep -q "TEST a SIMD instruction in a user program ends it.*PASS" build.log && \
+	 grep -q "TEST a SIMD instruction in a user program runs.*PASS" build.log && \
+	 grep -q "TEST eight programs keep their own FP/SIMD registers.*PASS" build.log && \
+	 grep -q "TEST MMAP: lazy zeroed memory.*PASS" build.log && \
+	 grep -q "TEST a touch of PROT_NONE memory.*PASS" build.log && \
 	 grep -q "TEST SYSINFO pages that list other tasks. capabilities refuse.*PASS" build.log && \
 	 grep -q "TEST a map that races a revoke never leaves.*PASS" build.log && \
 	 grep -q "TEST pages released by HEAP_RELEASE are not reachable.*PASS" build.log && \
@@ -384,7 +387,7 @@ qemu-test: kernel disk
 	 grep -q "TEST a program that allocates without checking is stopped at its limit.*PASS" build.log && \
 	 grep -q "TEST contiguous allocations count against the program's limit.*PASS" build.log && \
 	 grep -q "TEST a program with a budget of 700 pages starts two default programs.*PASS" build.log && \
-	 grep -q "TEST a program may have at most 8 programs at a time.*PASS" build.log && \
+	 grep -q "TEST a program may have at most 32 programs at a time.*PASS" build.log && \
 	 grep -q "TEST a program costs its heap + budget + 24 pages.*PASS" build.log && \
 	 grep -q "TEST a child's limits can be raised within the parent's budget.*PASS" build.log && \
 	 grep -q "TEST every frame and capability node the memory-limit tests used is back.*PASS" build.log && \

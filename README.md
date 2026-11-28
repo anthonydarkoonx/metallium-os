@@ -74,7 +74,7 @@ hammers the pages being moved from another core (faults that raced with a move a
 retried), verifies every page afterwards, then repeats with synchronous compaction.
 
 ## Task slots
-The number of task slots is chosen at boot (`task::tasks_for`): one per MiB of RAM, between 64 and 1024, or what the fw_cfg file `opt/metallium/max-tasks` says. All per-task state (task records, saved registers, scheduler slots, spawn bookkeeping) is carved out of RAM at that size (`kernel/src/table.rs`), and so are the endpoint table (the 22 boot-time endpoints and `MAX_OWNED_EPS` = 4 for every task slot: 4118 at 1024 slots) and the memory-object table (64 boot-time entries and 8 for every slot, at least 192). The capability node pool holds 8192 nodes. Endpoint and object ids are 16 bits. `make scale` starts programs until all 997 free slots of a 1024-slot table are used (each holding 4 endpoints and 2 shared-memory objects), ends them together and checks that every frame, node and slot comes back.
+The number of task slots is chosen at boot (`task::tasks_for`): one per MiB of RAM, between 64 and 1024, or what the fw_cfg file `opt/metallium/max-tasks` says. All per-task state (task records, saved registers, scheduler slots, spawn bookkeeping) is carved out of RAM at that size (`kernel/src/table.rs`), and so are the endpoint table (the 22 boot-time endpoints and `MAX_OWNED_EPS` = 16 for every task slot: 16409 at 1024 slots) and the memory-object table (64 boot-time entries and 32 for every slot, at least 1024). The capability node pool holds 8192 nodes. Endpoint and object ids are 16 bits. `make scale` starts programs until all 997 free slots of a 1024-slot table are used (each holding 4 endpoints and 2 shared-memory objects), ends them together and checks that every frame, node and slot comes back.
 
 ## Scheduling, SMP and locking
 Cores come up through PSCI `CPU_ON` (up to 32; how many, and their MPIDRs, come from the device tree), each with its own stack (made from RAM, with an unmapped guard below it), MMU setup and timer. There is
@@ -189,8 +189,8 @@ an 8-byte name, then code) and static ELF files. The program starts at EL0 with 
 parent. A program
 holds the console and exactly the capabilities its parent chose to delegate (up to eight, by slot, only those the
 parent holds with the grant right; the grant right itself is not passed on) and a heap quota the parent sets (at most
-4096 pages). Memory limits are hierarchical: a program also gets a *budget* of pages it may hand down, a spawn costs the
-parent `heap + budget + 24` pages (plus one per loaded image page) until the child is gone, a program may have at most 8
+1 048 576 pages). Memory limits are hierarchical: a program also gets a *budget* of pages it may hand down, a spawn costs the
+parent `heap + budget + 24` pages (plus one per loaded image page) until the child is gone, a program may have at most 32
 programs at a time, contiguous allocations count against the same limit as the heap, and a parent can resize a child
 (`QUOTA`). So a tree of programs cannot hold more than its root's budget, whatever it does (see `docs/ABI.md`).
 
@@ -207,7 +207,7 @@ of the scheduler are 64 bits wide now (it was 32 tasks).
 
 Programs can also **serve**: `EP_CREATE` (with a `Factory` capability) makes an endpoint at run time, owned by the
 capability it returns; the creator delegates a receive copy to a server program and send-only copies to clients, and
-revoking or destroying it wakes whoever waits on it (sixteen exist at most, four per task). With `file access` in the
+revoking or destroying it wakes whoever waits on it (sixteen per program; the table holds sixteen for every task slot). With `file access` in the
 spawn request a program gets a VFS session (one page per program slot, a quarter as many as task slots, 8 to 255; the VFS server asks the kernel which page belongs to a
 sender, and starts a new program in a reused slot with no open files). The request block (`SPAWN` takes the address of a
 96-byte structure) also carries the argument block (NUL-separated strings copied onto the child's stack) and
@@ -217,8 +217,21 @@ the previous pipeline stage or the keyboard (Ctrl-D ends it), and Ctrl-C ends th
 AArch64 `ET_EXEC`, or position-independent `ET_DYN` with a random kernel-chosen base in a 248 GiB range; every program in `/bin` and the boot-time services are built that way) load as well as the flat images; a malformed one is refused for the right reason (segments outside
 the image window, writable-and-executable pages, dynamic linking, truncated files, ...). `docs/ABI.md` is the complete interface.
 
+## Anonymous memory: MMAP, MUNMAP, MPROTECT
+`HEAP_GROW` gives a program a heap that only grows; C and C++ ports (a libc's allocator, a dynamic linker, a JIT, Qt) want memory they can place, free in pieces and
+protect. `MMAP(addr, pages, prot | flags)` reserves `pages` pages of address space in a 128 GiB arena (`task::MMAP_LO..MMAP_HI`) and **allocates nothing**: a page gets
+its zeroed frame at its first touch (a fault, or a system call that reads or fills it), and only then counts against the program's memory limit, so a 2 GiB reservation of which
+one page is used costs one page (and a page-table page per 2 MiB reserved; at most 4 GiB of reservations per program). The state lives in the page table itself, in software
+bits of the descriptor (`ANON`, and `LAZY` for a page not touched yet, `kernel/src/mmu.rs`), so there is no region list to run out of: `MUNMAP` and `MPROTECT` work on any
+sub-range, whatever the state of its pages (in a frame, swapped out, on disk, untouched). Memory from `MMAP` is ordinary movable memory: the compactor moves it and the swap
+system evicts and brings it back like heap. Protections are none, read, read+write and read+execute; **write and execute never go together**: code is made by writing a region
+and then `MPROTECT`ing it to read+execute, which cleans the data cache and invalidates every core's instruction cache first (it can be flipped back and forth). `MAP_FIXED`
+re-maps only inside what the kernel gave the program (a dynamic linker laying out its segments in a region it reserved), or at a free place if the program may name addresses,
+so the layout stays unguessable for programs that must not. `MEM_MAP` of shared memory also falls back to the arena when its two small windows are full. Test: `programs/src/bin/mmaptest.rs`
+(the `make quick-programs` run: lazy accounting, partial unmapping, `MAP_FIXED`, W^X, code made executable twice, the kernel faulting in an untouched page, five forced faults).
+
 ## Threads
-A program may be given an allowance of up to eight *threads* (`THREAD_CREATE`): extra tasks that run in its address
+A program may be given an allowance of up to 64 *threads* (`THREAD_CREATE`): extra tasks that run in its address
 space, each with its own registers, stack, capability table (copies of chosen capabilities of the creator) and
 scheduling state, so they run on different cores at once. The memory side — page tables, mappings, heap and its quota,
 the owner of every frame — stays with the program's first task, which is also the name the file system and the parent

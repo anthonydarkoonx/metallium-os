@@ -29,6 +29,38 @@ const UXN: u64 = 1 << 54;
 pub const DEVICE_BLOCK: u64 = VALID_BLOCK | ATTR_DEVICE | AF | PXN | UXN;
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
+/// Software bits of a user descriptor (the hardware ignores bits 58:55). `ANON`: the page belongs to an `MMAP` region (valid or not, in a
+/// frame, swapped out, or not yet touched). `LAZY` (with bit 0 clear): reserved by `MMAP` and not touched yet; the permission bits are
+/// those the page will get when the first access to it allocates a zeroed frame (`populate_lazy`).
+const LAZY: u64 = 1 << 57;
+const ANON: u64 = 1 << 58;
+const PERM_MASK: u64 = AP_EL0 | AP_RO | UXN;
+
+/// Protection bits of `MMAP`/`MPROTECT`. Write and execute never go together (checked by the system calls); write or execute implies read.
+pub const PROT_R: u8 = 1;
+pub const PROT_W: u8 = 2;
+pub const PROT_X: u8 = 4;
+
+/// The permission bits of a descriptor for `prot`: none is read-only with no EL0 access at all (a guard).
+fn prot_bits(prot: u8) -> u64 {
+    if prot & PROT_X != 0 {
+        AP_EL0 | AP_RO
+    } else if prot & PROT_W != 0 {
+        AP_EL0 | UXN
+    } else if prot & PROT_R != 0 {
+        AP_EL0 | AP_RO | UXN
+    } else {
+        AP_RO | UXN
+    }
+}
+
+fn prot_of(pte: u64) -> u8 {
+    if pte & AP_EL0 == 0 {
+        return 0;
+    }
+    PROT_R | if pte & AP_RO == 0 { PROT_W } else { 0 } | if pte & UXN == 0 { PROT_X } else { 0 }
+}
+
 pub const USER_LO: usize = 0x8000_0000;
 pub const USER_HI: usize = 0xC000_0000;
 
@@ -420,8 +452,10 @@ pub fn unmap_user(l1: usize, va: usize) {
 pub enum Page {
     /// Nothing mapped.
     Absent,
-    /// In a frame. `young`: the access flag is set (the page was touched since it was last aged).
-    Resident { pa: usize, young: bool, exec: bool },
+    /// In a frame. `young`: the access flag is set (the page was touched since it was last aged). `anon`: a page of an `MMAP` region.
+    Resident { pa: usize, young: bool, exec: bool, anon: bool },
+    /// Reserved by `MMAP` and not touched yet: the protection (`PROT_*`) it will have. The first access allocates a zeroed frame.
+    Lazy(u8),
     /// In the swap store: the handle to load it back with.
     Swapped(u32),
     /// Written to the disk by the pager (pager.rs): the disk slot to read it back from.
@@ -441,11 +475,106 @@ pub fn inspect(l1: usize, va: usize) -> Page {
         return Page::Absent;
     }
     match leaf(l1, va, None) {
-        Some(&mut pte) if pte & 1 != 0 => Page::Resident { pa: (pte & ADDR_MASK) as usize, young: pte & AF != 0, exec: pte & UXN == 0 },
+        Some(&mut pte) if pte & 1 != 0 => Page::Resident { pa: (pte & ADDR_MASK) as usize, young: pte & AF != 0, exec: pte & UXN == 0, anon: pte & ANON != 0 },
+        Some(&mut pte) if pte & LAZY != 0 => Page::Lazy(prot_of(pte)),
         Some(&mut pte) if pte & SWAPPED != 0 && pte & ON_DISK != 0 => Page::Disk(((pte & ADDR_MASK) >> 12) as u32),
         Some(&mut pte) if pte & SWAPPED != 0 => Page::Swapped(((pte & ADDR_MASK) >> 12) as u32),
         _ => Page::Absent,
     }
+}
+
+/// Reserve the page at `va` for `MMAP`: nothing is allocated (but the page-table pages, owned by `owner`) until it is first touched.
+pub fn reserve_anon(l1: usize, va: usize, prot: u8, owner: mem::Owner) -> Result<(), ()> {
+    if !in_user(va) {
+        return Err(());
+    }
+    let slot = leaf(l1, va, Some(owner)).ok_or(())?;
+    if *slot != 0 {
+        return Err(());
+    }
+    *slot = LAZY | ANON | prot_bits(prot);
+    Ok(())
+}
+
+/// Forget a reserved page that was never touched; false if the descriptor is not one.
+pub fn clear_lazy(l1: usize, va: usize) -> bool {
+    match leaf(l1, va & !(mem::PAGE - 1), None) {
+        Some(slot) if *slot & 1 == 0 && *slot & LAZY != 0 => {
+            *slot = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// First touch of a reserved page: map the (zeroed) frame `pa` with the permissions reserved for it. False if the descriptor is not a reserved page.
+pub fn populate_lazy(l1: usize, va: usize, pa: usize) -> bool {
+    let Some(slot) = leaf(l1, va & !(mem::PAGE - 1), None) else { return false };
+    if *slot & 1 != 0 || *slot & LAZY == 0 {
+        return false;
+    }
+    let exec = *slot & UXN == 0 && *slot & AP_EL0 != 0;
+    if exec {
+        sync_icache(pa, mem::PAGE);
+    }
+    *slot = pa as u64 | VALID_TABLE | AF | NG | PXN | ATTR_NORMAL | SH_INNER | ANON | (*slot & PERM_MASK);
+    // SAFETY: barrier only; publishes the descriptor store above to the table walkers and synchronises the context.
+    unsafe { asm!("dsb ishst", "isb") };
+    true
+}
+
+/// Is the page at `va` part of an `MMAP` region (in any state)? `None`: nothing is there.
+pub fn is_anon(l1: usize, va: usize) -> Option<bool> {
+    let slot = leaf(l1, va & !(mem::PAGE - 1), None)?;
+    (*slot != 0).then_some(*slot & ANON != 0)
+}
+
+/// Change the protection of an `MMAP` page, whatever its state (a swapped-out or reserved page keeps it in its descriptor). `None`: not an
+/// `MMAP` page. `Some(Some(pa))`: it is in frame `pa` and has become executable, so the caller makes the code visible to instruction fetch
+/// (`clean_dcache_pou`, `flush_icache`); in any case the caller flushes the TLBs after the last page, which makes the new permissions apply.
+pub fn set_prot(l1: usize, va: usize, prot: u8) -> Option<Option<usize>> {
+    let slot = leaf(l1, va & !(mem::PAGE - 1), None)?;
+    if *slot == 0 || *slot & ANON == 0 {
+        return None;
+    }
+    let was_exec = *slot & UXN == 0 && *slot & AP_EL0 != 0;
+    *slot = (*slot & !PERM_MASK) | prot_bits(prot);
+    let now_exec = prot & PROT_X != 0;
+    if *slot & 1 != 0 {
+        // SAFETY: barrier only; publishes the descriptor store above to the table walkers.
+        unsafe { asm!("dsb ishst") };
+        if now_exec && !was_exec {
+            return Some(Some((*slot & ADDR_MASK) as usize));
+        }
+    }
+    Some(None)
+}
+
+/// Is every page of `va..va + pages * PAGE` unmapped (no frame, no swapped page, no reservation)? Skips whole empty tables, so a large
+/// empty range is cheap to check.
+pub fn range_free(l1: usize, va: usize, pages: usize) -> bool {
+    let Some(end) = pages.checked_mul(mem::PAGE).and_then(|n| va.checked_add(n)) else { return false };
+    let mut a = va;
+    while a < end {
+        if !in_user_range(a) {
+            return false;
+        }
+        let e1 = table(l1)[(a >> 30) & 511];
+        if e1 & 1 == 0 {
+            a = (a | ((1 << 30) - 1)) + 1;
+            continue;
+        }
+        let e2 = table((e1 & ADDR_MASK) as usize)[(a >> 21) & 511];
+        if e2 & 1 == 0 {
+            a = (a | ((1 << 21) - 1)) + 1;
+            continue;
+        }
+        if table((e2 & ADDR_MASK) as usize)[(a >> 12) & 511] != 0 {
+            return false;
+        }
+        a += mem::PAGE;
+    }
+    true
 }
 
 /// Mapped now, or swapped out (the address is taken either way).
@@ -617,8 +746,8 @@ fn translate_for(l1: usize, va: usize, write: bool) -> Option<usize> {
         return None;
     }
     let pte = *leaf(l1, page, None)?;
-    if pte & 1 == 0 || (write && pte & AP_RO != 0) {
-        return None;
+    if pte & 1 == 0 || pte & AP_EL0 == 0 || (write && pte & AP_RO != 0) {
+        return None; // (a page the program may not touch at all, `PROT_NONE`, is not read or written for it either)
     }
     Some((pte & ADDR_MASK) as usize | (va & (mem::PAGE - 1)))
 }
@@ -677,6 +806,12 @@ pub fn flush_tlb() {
 
 /// Make freshly written code visible to instruction fetch.
 pub fn sync_icache(pa: usize, len: usize) {
+    clean_dcache_pou(pa, len);
+    flush_icache();
+}
+
+/// Clean the data cache of `pa..pa+len` to the point of unification (the first half of `sync_icache`: do it for every page, then `flush_icache` once).
+pub fn clean_dcache_pou(pa: usize, len: usize) {
     let step = crate::cache::line();
     let pa = crate::frame::phys::cache_va(pa); // (a page above the identity window is reached through the direct map: the instruction takes a virtual address)
     let mut a = pa & !(step - 1);
@@ -685,6 +820,10 @@ pub fn sync_icache(pa: usize, len: usize) {
         unsafe { asm!("dc cvau, {}", in(reg) a) };
         a += step;
     }
+}
+
+/// Invalidate the instruction caches of every core, after the data caches were cleaned (`clean_dcache_pou`).
+pub fn flush_icache() {
     // SAFETY: barriers plus an instruction-cache invalidate to the point of unification; drops cached instructions only, so fetch
     // sees the cleaned bytes.
     unsafe { asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };

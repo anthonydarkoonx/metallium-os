@@ -9,7 +9,7 @@ pub const NCAPS: usize = 32;
 /// already use two thirds of 254 nodes, leaving too little for two windowed programs at once.)
 pub type NodeId = u16;
 /// Capability nodes in the whole system: enough for a thousand tasks with several capabilities each.
-pub const NODES: usize = 8192;
+pub const NODES: usize = 16384;
 
 /// A set of nodes (a bit each): what a revoke marks.
 #[derive(Clone, Copy)]
@@ -194,7 +194,7 @@ pub fn mint_node(parent: Option<(NodeId, u32)>) -> Option<Minted> {
 /// Most nodes one program (all its threads together) may hold that it made for itself: its own memory and endpoints, its threads'
 /// copies of capabilities, what it gives the programs it starts. Programs may also never take the last `GRANT_RESERVE` nodes:
 /// those are for restarting a boot service (which cannot fail) and for starting programs.
-pub const PROGRAM_NODE_QUOTA: usize = 192;
+pub const PROGRAM_NODE_QUOTA: usize = 768;
 
 /// A node for `owner`, a program's address space (charged to it, and refused over `PROGRAM_NODE_QUOTA` or into the reserve), or
 /// for anything else (a boot-time task: unlimited, as `mint_node`).

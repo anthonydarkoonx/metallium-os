@@ -81,7 +81,7 @@ pub const CONDUCTOR_HEAP_PAGES: usize = 60_000;
 /// What a boot-time task may hand down to the programs it starts: the conductor (which runs the test suites) a good deal
 /// of the machine, the others (shell, the programs task, the fuzzer) 32 MiB.
 pub const CONDUCTOR_BUDGET_PAGES: usize = 30_000;
-pub const ROLE_BUDGET_PAGES: usize = 8_192;
+pub const ROLE_BUDGET_PAGES: usize = 1 << 18; // (1 GiB of pages: a desktop session starts programs of hundreds of MiB)
 /// Where a task's submission/completion ring page is mapped (see ring.rs).
 /// (the page is put at a random page of the 16 MiB from here, `RING_SLIDE_PAGES`)
 pub const RING_VA: usize = 0x8F00_0000;
@@ -90,6 +90,14 @@ pub const RING_SLIDE_PAGES: usize = 4096;
 /// the 39-bit address space (L1 entries 8..256: below the ECAM window, above the 4 GiB the SoC's devices may use).
 pub const PIE_LO: usize = 0x2_0000_0000;
 pub const PIE_HI: usize = 0x40_0000_0000;
+/// Position-independent images are placed in the lower half of that range (`PIE_LO..PIE_IMG_HI`); the upper half is the arena of
+/// `MMAP` (`MMAP_LO..MMAP_HI`, 128 GiB): anonymous memory that programs map, unmap and reprotect page by page (syscall.rs `mmap`).
+pub const PIE_IMG_HI: usize = 0x20_0000_0000;
+pub const MMAP_LO: usize = 0x20_0000_0000;
+pub const MMAP_HI: usize = PIE_HI;
+/// Most pages of address space one program may have reserved with `MMAP` at a time (4 GiB). A reservation costs only page-table
+/// entries until a page is touched; what is touched counts against the program's memory limit like heap.
+pub const MAX_ANON_VIRT_PAGES: usize = 1 << 20;
 /// The largest position-independent image: 8 MiB (a fixed one has to fit below the first mappings: `IMAGE_END`).
 pub const PIE_MAX_IMAGE: usize = 8 << 20;
 pub const SHM_LO: usize = 0x8020_0000;
@@ -97,7 +105,7 @@ pub const SHM_HI: usize = 0x8040_0000;
 /// A second, large window for shared memory (512 MiB): for programs that map many big buffers.
 pub const BIG_SHM_LO: usize = 0xA000_0000;
 pub const BIG_SHM_HI: usize = 0xC000_0000;
-pub const MAX_MAPS: usize = 64;
+pub const MAX_MAPS: usize = 256;
 /// A task that keeps crashing is left dead rather than restarted forever.
 /// A service may be restarted this many times in a row ...
 const MAX_RESTARTS: u32 = 5;
@@ -141,6 +149,13 @@ pub struct Task {
     pub caps: [Cap; NCAPS],
     pub maps: [MapRec; MAX_MAPS],
     pub heap_pages: usize,
+    /// Pages of `MMAP` memory that have been touched (and so hold a frame, or sit in the swap store or on disk): they count against the
+    /// program's memory limit. Atomic so that a fault or a system call that reads user memory can add one under a shared borrow.
+    pub anon_pages: AtomicUsize,
+    /// Pages of address space reserved with `MMAP` (touched or not), against `MAX_ANON_VIRT_PAGES`.
+    pub anon_virt: AtomicUsize,
+    /// Where the next `MMAP` without an address is tried (0: not chosen yet; the first is a random place in the arena).
+    pub mmap_next: usize,
     /// Thread stacks the kernel made (`THREAD_CREATE` with no stack): (lowest mapped address, pages, thread); pages are
     /// counted against the heap limit.
     pub tstacks: [(usize, usize, u16); crate::spawn::MAX_THREADS],
@@ -158,7 +173,14 @@ pub struct Task {
 impl Task {
     /// Pages held against the program's heap limit (contiguous allocations are counted separately).
     pub fn held_pages(&self) -> usize {
-        self.heap_pages + self.tstacks.iter().map(|s| s.1).sum::<usize>()
+        self.heap_pages + self.anon_pages.load(Ordering::Relaxed) + self.tstacks.iter().map(|s| s.1).sum::<usize>()
+    }
+
+    /// A new address space has no `MMAP` memory.
+    pub fn reset_anon(&mut self) {
+        self.anon_pages.store(0, Ordering::Relaxed);
+        self.anon_virt.store(0, Ordering::Relaxed);
+        self.mmap_next = 0;
     }
 
     const EMPTY: Task = Task {
@@ -166,6 +188,9 @@ impl Task {
         caps: [Cap::NONE; NCAPS],
         maps: [MapRec { used: false, va: 0, pages: 0, node: 0 }; MAX_MAPS],
         heap_pages: 0,
+        anon_pages: AtomicUsize::new(0),
+        anon_virt: AtomicUsize::new(0),
+        mmap_next: 0,
         tstacks: [(0, 0, 0); crate::spawn::MAX_THREADS],
         stack_top: 0,
         heap_base: 0,
@@ -542,10 +567,10 @@ fn boot_caps(t: &mut Task, tid: usize, role: u8) {
 }
 
 
-/// A random base for a position-independent image (`spawn::FLAG_PIE` and the boot-time programs): a page in `PIE_LO..PIE_HI`
+/// A random base for a position-independent image (`spawn::FLAG_PIE` and the boot-time programs): a page in `PIE_LO..PIE_IMG_HI`
 /// with room for `PIE_MAX_IMAGE` after it.
 pub fn random_pie_base() -> usize {
-    PIE_LO + crate::rand::below((PIE_HI - PIE_LO - PIE_MAX_IMAGE) / PAGE + 1) * PAGE
+    PIE_LO + crate::rand::below((PIE_IMG_HI - PIE_LO - PIE_MAX_IMAGE) / PAGE + 1) * PAGE
 }
 
 fn build(t: &mut Task, tid: usize) -> Result<(), &'static str> {
@@ -593,6 +618,7 @@ fn build(t: &mut Task, tid: usize) -> Result<(), &'static str> {
     t.caps = [Cap::NONE; NCAPS];
     t.maps = [MapRec { used: false, va: 0, pages: 0, node: 0 }; MAX_MAPS];
     t.heap_pages = 0;
+    t.reset_anon();
     t.tstacks = [(0, 0, 0); crate::spawn::MAX_THREADS];
     t.ring_pa = 0;
     t.pending = [crate::ring::Pending::FREE; crate::ring::MAX_PENDING];

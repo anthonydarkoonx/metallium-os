@@ -106,7 +106,7 @@ static OBJS: SpinLock<&'static mut [MemObj]> = SpinLock::new(&mut []);
 
 /// How many object-table entries a machine with `tasks` task slots gets.
 pub fn objs_for(tasks: usize) -> usize {
-    (FIRST_DYNAMIC + (8 * tasks).max(192)).min(u16::MAX as usize)
+    (FIRST_DYNAMIC + (32 * tasks).max(1024)).min(u16::MAX as usize)
 }
 
 /// Carve the object table for `n` entries; called once from `main`.
@@ -178,7 +178,7 @@ pub fn make_sessions(region: u16, first: u16) {
 const NO_OWNER: u16 = u16::MAX;
 /// Most run-time objects one program may have, and the object-table entries programs may never take (boot-time services make
 /// objects too, and must not find the table full because programs filled it).
-pub const PROGRAM_OBJ_QUOTA: usize = 32;
+pub const PROGRAM_OBJ_QUOTA: usize = 256;
 const OBJ_RESERVE: usize = 16;
 
 fn owner_tag(owner: usize) -> u16 {
@@ -250,8 +250,8 @@ pub fn kbd_present() -> bool {
 // flag 1 frees the object and unmaps it everywhere. When the creator merely exits, holders keep what they have (an
 // *orphan*, see `shm_orphan`): the memory goes when the last of them lets go.
 
-/// Most pages one shared object may have (16 MiB).
-pub const SHM_MAX_PAGES: usize = 4096;
+/// Most pages one shared object may have (256 MiB).
+pub const SHM_MAX_PAGES: usize = 65536;
 const PER_LIST_PAGE: usize = mem::PAGE / 4;
 
 /// Frames for a new shared object of `pages` pages owned by `owner`, and the list that names them (its address).

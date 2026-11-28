@@ -74,8 +74,9 @@ fn manifest_rules() {
     assert!(!ok(&std::format!("{base}extra = 1\n")), "unknown key");
     assert!(!ok(&std::format!("{base}id = b\n")), "duplicate key");
     assert!(!ok(&std::format!("{base}permission = root\n")), "unknown permission");
-    assert!(!ok(&std::format!("{base}heap_pages = 0\n")) && !ok(&std::format!("{base}heap_pages = 20000\n")));
-    assert!(!ok(&std::format!("{base}threads = 9\n")));
+    assert!(!ok(&std::format!("{base}heap_pages = 0\n")) && !ok(&std::format!("{base}heap_pages = 1048577\n")));
+    assert!(ok(&std::format!("{base}heap_pages = 1048576\n")) && ok(&std::format!("{base}threads = 64\n")));
+    assert!(!ok(&std::format!("{base}threads = 65\n")));
     assert!(ok(&std::format!("{base}quota = 100\n")) && ok(&std::format!("{base}quota = 1024\n")));
     assert!(!ok(&std::format!("{base}quota = 0\n")) && !ok(&std::format!("{base}quota = 1025\n")) && !ok(&std::format!("{base}quota = many\n")), "quota range");
     assert_eq!(parse_manifest(&std::format!("{base}quota = 100\n")).unwrap().quota, 100);
@@ -302,9 +303,9 @@ fn the_spawn_permission_and_its_budget() {
     assert!(!plain.spawn && !plain.has(Permission::Spawn));
     assert_eq!(plain.spawn_pages, 0, "nothing to hand down without spawn");
     assert_eq!(parse_manifest(&std::format!("{base}spawn_pages = 64\n")), Err(Error::BadManifest("spawn_pages needs permission = spawn")));
-    for bad in ["0", "16385", "lots", "-1"] {
+    for bad in ["0", "1048577", "lots", "-1"] {
         assert!(parse_manifest(&std::format!("{base}permission = spawn\nspawn_pages = {bad}\n")).is_err(), "{bad}");
     }
-    assert!(parse_manifest(&std::format!("{base}permission = spawn\nspawn_pages = 16384\n")).is_ok());
+    assert!(parse_manifest(&std::format!("{base}permission = spawn\nspawn_pages = 1048576\n")).is_ok());
     assert!(parse_manifest(&std::format!("{base}permission = spawn\nspawn_pages = 1\nspawn_pages = 2\n")).is_err(), "duplicate key");
 }
