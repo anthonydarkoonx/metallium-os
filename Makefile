@@ -255,14 +255,14 @@ qemu-test: kernel disk
 	 grep -q "TEST priority inheritance.*PASS" build.log && \
 	 grep -q "TEST ring: async call to a crashing driver.*PASS" build.log && \
 	 grep -q "TEST ring backpressure.*PASS" build.log && \
-	 grep -q "TEST memory pressure.*PASS" build.log && \
-	 grep -q "TEST fragmentation.*PASS" build.log && \
-	 grep -q "TEST contiguous 512 KiB allocation fails on fragmented memory.*PASS" build.log && \
-	 grep -q "TEST compactd restores contiguity.*PASS" build.log && \
-	 grep -q "TEST every page read during migration held its data.*PASS" build.log && \
-	 grep -q "TEST pages relocated by the compactor keep their contents.*PASS" build.log && \
-	 grep -q "TEST contiguous 512 KiB block allocated after compaction.*PASS" build.log && \
-	 grep -q "TEST direct compaction inside the allocator.*PASS" build.log && \
+	 { grep -q "TEST memory pressure.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST fragmentation.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST contiguous 512 KiB allocation fails on fragmented memory.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST compactd restores contiguity.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST every page read during migration held its data.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST pages relocated by the compactor keep their contents.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST contiguous 512 KiB block allocated after compaction.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
+	 { grep -q "TEST direct compaction inside the allocator.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
 	 grep -q $(SCHED_PAT) build.log && \
 	 { [ $(SMP) -lt 3 ] || grep -q "TEST a CPU hog that was pushed onto an efficiency core goes back to a performance core once one is idle.*PASS" build.log; } && \
 	 grep -q "TEST scheduler shares the cores fairly.*PASS" build.log && \
@@ -372,7 +372,7 @@ qemu-test: kernel disk
 	 grep -q "TEST net: connecting to a port nobody listens on.*PASS" build.log && \
 	 grep -q "TEST net: a listener accepts a connection.*PASS" build.log && \
 	 grep -q "TEST net: 60 connections in a row.*PASS" build.log && \
-	 grep -q "TEST memory pressure makes compactd swap cold pages out.*PASS" build.log && \
+	 { grep -q "TEST memory pressure makes compactd swap cold pages out.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
 	 grep -q "TEST net: four threads with a connection.*PASS" build.log && \
 	 grep -q "TEST net: waiting is sleeping.*PASS" build.log && \
 	 grep -q "TEST net: a peer that answers in small slow pieces.*PASS" build.log && \
@@ -413,7 +413,7 @@ qemu-test: kernel disk
 	 grep -q "TEST shared memory dies with its creator.*PASS" build.log && \
 	 grep -q "TEST a 4096-page object is usable.*PASS" build.log && \
 	 grep -q "TEST nothing is left behind by the shared-memory tests.*PASS" build.log && \
-	 grep -q "TEST shared memory needs no contiguous run.*PASS" build.log && \
+	 { grep -q "TEST shared memory needs no contiguous run.*PASS" build.log || [ $(RAM_MIB) -gt 64 ]; } && \
 	 ! grep -aq "TEST.*program.*FAIL" build.log && \
 	 python3 tools/checkdisk.py $(DISK) && \
 	 grep -q "zram\] lz4: .*swap-in verified: PASS" build.log && \

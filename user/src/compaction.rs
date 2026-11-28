@@ -221,7 +221,19 @@ fn verify_range(first: usize, _count: usize, lo: usize, hi: usize, salt: u64, li
     (lo..hi).all(|p| !live(p) || check(first + p, p as u64 + salt))
 }
 
+/// Can this task use up the machine's free memory with its own heap? The tests of what happens at the end of memory mean nothing if not, and trying would use up
+/// the task's whole quota (the heap that was grown and released still counts against it) and leave every later allocation of the conductor to fail: on a larger
+/// machine (2 GiB, say, against a quota of 60 000 pages) they are skipped.
+fn can_exhaust() -> bool {
+    let q = svc(36, 0, 0, 0, 0, 0); // QUOTA: limit, held
+    stats(11).free < q[0].saturating_sub(q[1])
+}
+
 pub fn compaction_tests() {
+    if !can_exhaust() {
+        println!("[client] TEST memory compaction: SKIPPED (RAM too large to exhaust with this task's quota; run with -m 64M)");
+        return;
+    }
     let Some((first, count)) = fill() else {
         println!("[client] TEST memory compaction: SKIPPED (RAM too large to exhaust with this task's quota; run with -m 64M)");
         return;
@@ -454,6 +466,10 @@ pub fn swap_tests() {
         s5b.stored, s6.stored, s6.back - s5b.back, verdict(freed as usize == N && s5b.stored - s6.stored == N as u64 && s6.back == s5b.back));
 
     // real pressure: use up memory; compactd's policy must push cold pages out, and everything must survive
+    if !can_exhaust() {
+        println!("[client] TEST memory pressure: SKIPPED (RAM too large to exhaust with this task's quota; run with -m 64M)");
+        return;
+    }
     let mut held = 0usize;
     let first2;
     {
