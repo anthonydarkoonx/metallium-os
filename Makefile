@@ -142,7 +142,7 @@ kernel: user
 # Programs started with SPAWN (programs/): position-independent ELF files in programs/build (random image base each run; the
 # loader relocates them), packed into the system image under /bin. `sleeper` stays a flat image (the user crate embeds
 # it); the static `.elf` copies of argdump and hello exist to test the loader's fixed-address path.
-PROGRAM_BINS := mmaptest fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
+PROGRAM_BINS := captest mmaptest fptest racetest guardtest pager pagetest hello crash ping mem burn spawner cat fswrite ls fdprobe kv kvc blocker argdump upper threads stdtest nettest netcheck fetch quotatest shmtest pietest progmgr progctl counter crasher hog probe fsprog sessiond homeprobe
 PIE_FLAGS := -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro --cfg getrandom_backend=\"custom\"
 programs:
 	rm -rf programs/build; mkdir -p programs/build
@@ -290,6 +290,8 @@ qemu-test: kernel disk
 	 grep -q "TEST revoking the server's capability wakes it.*PASS" build.log && \
 	 grep -q "TEST a caller waiting on an endpoint that ends is told so.*PASS" build.log && \
 	 grep -q "TEST a task can create endpoints until it has no capability slot.*PASS" build.log && \
+	 grep -q "TEST capabilities travel in messages between unrelated programs.*PASS" build.log && \
+	 grep -q "TEST every capability node and frame the capability-passing test used is back.*PASS" build.log && \
 	 grep -q "TEST program packages in the system image install.*PASS" build.log && \
 	 grep -q "TEST a corrupt package, one whose id differs.*PASS" build.log && \
 	 grep -q "TEST signatures: an unsigned package, one signed by a key.*PASS" build.log && \

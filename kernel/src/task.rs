@@ -166,6 +166,8 @@ pub struct Task {
     pub pending: [crate::ring::Pending; crate::ring::MAX_PENDING],
     /// (caller, async tag or 0) we still owe a reply to.
     pub reply_to: Option<(u16, u8)>,
+    /// Our outstanding synchronous call said it would take a capability with the reply (`CAP_ACCEPT`).
+    pub reply_cap_ok: bool,
     /// Server currently handling our outstanding call.
     pub callee: Option<u16>,
 }
@@ -197,6 +199,7 @@ impl Task {
         ring_pa: 0,
         pending: [crate::ring::Pending::FREE; crate::ring::MAX_PENDING],
         reply_to: None,
+        reply_cap_ok: false,
         callee: None,
     };
 }

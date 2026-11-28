@@ -287,7 +287,7 @@ fn exec(cur: usize, q: Sqe) {
             if no_slot {
                 return fail(E_FULL);
             }
-            match ipc::send(cur, c.obj, Msg { sender: cur as u16, call, tag, w: q.w }) {
+            match ipc::send(cur, c.obj, Msg { sender: cur as u16, call, tag, w: q.w, cap: None }) {
                 Ok(()) if call => {} // completes when the server replies
                 Ok(()) => post(cur, q.ring_pa, q.ud, 0, [0; 3]),
                 Err(ipc::SendErr::Full) => fail(E_FULL),

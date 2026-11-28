@@ -176,14 +176,27 @@ fn run(cur: usize) -> (u64, Out) {
     let f = *frame(cur);
     let (id, a1, a2, a3, a4) = (f.x[0], f.x[1], f.x[2], f.x[3], f.x[4]);
     // These look at another task's state under its lock and then act on it: the end of that task must not slip in between (task.rs `TEARDOWN`).
-    let _life = matches!(id, CAP_GRANT | RESTORE_OF | SPAWN | WAIT | TASK_START | THREAD_CREATE).then(task::lifecycle);
+    // A message that carries a capability, or a receive that takes one, puts a copy into another task's table: the same exclusion as `CAP_GRANT`.
+    let moves_cap = match id {
+        IPC_SEND | IPC_CALL | IPC_REPLY_TO => f.x[5] & CAP_XFER != 0,
+        IPC_REPLY => a4 & CAP_XFER != 0,
+        IPC_RECV => a2 & RECV_ACCEPT != 0,
+        _ => false,
+    };
+    let _life = (moves_cap || matches!(id, CAP_GRANT | RESTORE_OF | SPAWN | WAIT | TASK_START | THREAD_CREATE)).then(task::lifecycle);
     let out = match id {
         YIELD => Out::Ret(0),
-        IPC_SEND | IPC_CALL => ipc_send(cur, a1, [a2, a3, a4], id == IPC_CALL),
-        IPC_RECV => ipc_recv(cur, a1, a2 != 0), // a2 != 0: do not wait (E_AGAIN, -10, if nothing is queued)
-        IPC_REPLY => Out::Ret(if ipc::reply(cur, [a1, a2, a3]) { 0 } else { E_NOREPLY }),
+        IPC_SEND | IPC_CALL => ipc_send(cur, a1, [a2, a3, a4], id == IPC_CALL, f.x[5]),
+        IPC_RECV => ipc_recv(cur, a1, a2 & 1 != 0, a2 & RECV_ACCEPT != 0), // a2 bit 0: do not wait (E_AGAIN, -10, if nothing is queued); bit 1: take a capability that comes with the message
+        IPC_REPLY => match cap_spec(cur, a4) {
+            Ok(cap) => Out::Ret(if ipc::reply(cur, [a1, a2, a3], cap) { 0 } else { E_NOREPLY }),
+            Err(e) => Out::Ret(e),
+        },
         IPC_DEFER => Out::Ret(ipc::defer(cur).map_or(E_NOREPLY, |t| t as i64)),
-        IPC_REPLY_TO => Out::Ret(if ipc::reply_to(cur, a1, [a2, a3, a4]) { 0 } else { E_NOREPLY }),
+        IPC_REPLY_TO => match cap_spec(cur, f.x[5]) {
+            Ok(cap) => Out::Ret(if ipc::reply_to(cur, a1, [a2, a3, a4], cap) { 0 } else { E_NOREPLY }),
+            Err(e) => Out::Ret(e),
+        },
         MEM_MAP => mem_map(cur, a1, a2 as usize, a3 != 0),
         CAP_GRANT => cap_grant(cur, a1, a2, a3 as Rights, a4),
         CAP_REVOKE => cap_revoke(cur, a1, a2 & 1 != 0),
@@ -402,24 +415,61 @@ fn ring_setup(cur: usize) -> i64 {
     ring::setup(&mut t, cur).map_or_else(|e| e, |va| va as i64)
 }
 
-fn ipc_send(cur: usize, slot: u64, w: [u64; 3], call: bool) -> Out {
+/// A capability travels with a message when the register that follows the words holds a transfer spec: `CAP_XFER` (bit 62) set, the sender's slot plus one in
+/// bits 0..7 (so 0 names no slot), the rights the copy gets in bits 8..23 (ANDed with the sender's own: rights only shrink). The sender needs the grant right on
+/// it, as for `CAP_GRANT`, and the console cannot be sent. On `IPC_CALL`, `CAP_ACCEPT` (bit 61) says the caller will take a capability with the reply. No
+/// spec (the marker bit clear: every caller that predates this, whatever else is in the register) sends none.
+const CAP_XFER: u64 = 1 << 62;
+const CAP_ACCEPT: u64 = 1 << 61;
+/// `IPC_RECV` argument bit 1: give the capability that comes with the message (if any) to this task; the receiver's table is not touched otherwise.
+const RECV_ACCEPT: u64 = 2;
+
+fn cap_spec(cur: usize, spec: u64) -> Result<Option<Cap>, i64> {
+    if spec & CAP_XFER == 0 {
+        return Ok(None);
+    }
+    let slot = spec & 0xFF;
+    if slot == 0 {
+        return Ok(None); // (flags only: an `IPC_CALL` that sends nothing but will take a capability with the reply)
+    }
+    if slot as usize > NCAPS {
+        return Err(E_BADCAP);
+    }
+    if slot as usize - 1 == CONSOLE_SLOT {
+        return Err(E_PERM);
+    }
+    let c = lookup_any(cur, slot - 1)?;
+    if c.rights & R_GRANT == 0 {
+        return Err(E_PERM);
+    }
+    Ok(Some(Cap { rights: c.rights & ((spec >> 8) & 0xFFFF) as Rights, ..c }))
+}
+
+fn ipc_send(cur: usize, slot: u64, w: [u64; 3], call: bool, spec: u64) -> Out {
     let c = match lookup(cur, slot, Kind::Endpoint, R_SEND) {
         Ok(c) => c,
         Err(e) => return Out::Ret(e),
     };
-    match ipc::send(cur, c.obj, Msg { sender: cur as u16, call, tag: 0, w }) {
+    let cap = match cap_spec(cur, spec) {
+        Ok(cap) => cap,
+        Err(e) => return Out::Ret(e),
+    };
+    if call {
+        task::lock(cur).reply_cap_ok = spec & CAP_ACCEPT != 0 && spec & CAP_XFER != 0;
+    }
+    match ipc::send(cur, c.obj, Msg { sender: cur as u16, call, tag: 0, w, cap }) {
         Err(ipc::SendErr::Full) => Out::Ret(E_FULL),
         Ok(()) if call => Out::Block, // `send` left the caller blocked in CallWait
         Ok(()) => Out::Ret(0),
     }
 }
 
-fn ipc_recv(cur: usize, slot: u64, nonblock: bool) -> Out {
+fn ipc_recv(cur: usize, slot: u64, nonblock: bool, accept: bool) -> Out {
     let c = match lookup(cur, slot, Kind::Endpoint, R_RECV) {
         Ok(c) => c,
         Err(e) => return Out::Ret(e),
     };
-    match ipc::recv(cur, c.obj, !nonblock) {
+    match ipc::recv(cur, c.obj, !nonblock, accept) {
         ipc::Recv::Got => Out::Ret(0), // payload already in x1..x5
         ipc::Recv::Blocked => Out::Block,
         ipc::Recv::Busy => Out::Ret(E_FULL),

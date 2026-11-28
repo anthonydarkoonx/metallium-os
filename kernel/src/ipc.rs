@@ -15,7 +15,7 @@ use crate::sched::{self, NO_PRIO};
 use crate::sync::{Guard, SpinLock, R_EP, R_EPCLAIM};
 use crate::task::{self, frame, State};
 use core::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use crate::cap::NodeId;
+use crate::cap::{Cap, Kind, NodeId, R_RECV};
 
 /// Endpoints 0..24 are the boot-time services'; the rest are created at run time (`EP_CREATE`, see below).
 pub const EP_FIRST_DYNAMIC: u16 = 25;
@@ -38,7 +38,7 @@ pub fn init_tables(n: usize) {
     NEP.store(n, Ordering::Relaxed);
     EP_NODE.init(n, |_| AtomicU16::new(NO_OWNER_NODE));
     EP_TASK.init(n, |_| AtomicU16::new(NO_OWNER));
-    EPS.init(n, |_| SpinLock::new(Endpoint { q: [NO_MSG; QLEN], head: 0, len: 0, waiter: None }));
+    EPS.init(n, |_| SpinLock::new(Endpoint { q: [NO_MSG; QLEN], head: 0, len: 0, waiter: None, accepts: false }));
     BEST.init(n, |_| AtomicU8::new(NO_PRIO));
     QUEUED.init(n, |_| AtomicU8::new(0));
     BEST_DEADLINE.init(n, |_| AtomicU64::new(u64::MAX));
@@ -78,9 +78,17 @@ pub struct Msg {
     /// 0 = synchronous caller blocked in IPC_CALL; otherwise 1 + index of the async call in the sender's ring.
     pub tag: u8,
     pub w: [u64; 3],
+    /// A capability the sender offers with the message: a snapshot of its own capability (the node and generation it was made under, so that the copy
+    /// that is made on delivery hangs under it and dies with it), rights already narrowed. Nothing is made until a receiver that asked for one takes
+    /// the message (`install_cap`), so a message that is dropped or never received costs no node.
+    pub cap: Option<Cap>,
 }
 
-const NO_MSG: Msg = Msg { sender: 0, call: false, tag: 0, w: [0; 3] };
+const NO_MSG: Msg = Msg { sender: 0, call: false, tag: 0, w: [0; 3], cap: None };
+
+/// What a receiver is told when a capability was offered and it could not be given: no free slot, over the node allowance, or the sender's capability
+/// was revoked in the meantime. (A slot number plus one is 1..=32; this is outside that.)
+pub const CAP_FAILED: u64 = 0xFF;
 
 pub struct Endpoint {
     q: [Msg; QLEN],
@@ -88,6 +96,8 @@ pub struct Endpoint {
     len: usize,
     /// Receiver sleeping on this endpoint.
     pub waiter: Option<u16>,
+    /// ... and whether it asked to be given a capability that comes with the message (`IPC_RECV` flag 2).
+    pub accepts: bool,
 }
 
 impl Endpoint {
@@ -271,15 +281,37 @@ fn set_callee(sender: &mut task::Task, tag: u8, rcv: usize) {
     }
 }
 
-/// Write a message into a receiver's saved registers (its pending IPC_RECV result).
-fn deliver_regs(rcv: usize, m: &Msg) {
+/// Give the capability `c`, offered with a message, to task `rcv` (whose table `t` the caller holds): a copy under the sender's node in the first free
+/// slot, charged to the receiver's program. The slot plus one, or `CAP_FAILED`. The caller holds the lifecycle lock (as `CAP_GRANT` does), so no revoke and
+/// no end of a task can run between the check that the sender's capability is alive (made under the node-table lock by `mint_for`) and the copy being in
+/// the table.
+fn install_cap(t: &mut task::Task, rcv: usize, c: &Cap) -> u64 {
+    if c.kind == Kind::None || c.kind == Kind::Console || !c.alive() {
+        return CAP_FAILED;
+    }
+    let Some(dst) = (0..crate::cap::NCAPS).find(|&i| i != crate::syscall::CONSOLE_SLOT && t.caps[i].kind == Kind::None) else { return CAP_FAILED };
+    let Some(node) = crate::cap::mint_for(task::aspace(rcv), Some(c.parent_ref())) else { return CAP_FAILED };
+    t.caps[dst] = c.under(c.rights, node);
+    if c.kind == Kind::Endpoint && c.rights & R_RECV != 0 {
+        sched::note_recv_endpoint(rcv, c.obj);
+    }
+    dst as u64 + 1
+}
+
+/// Write a message into a receiver's saved registers (its pending IPC_RECV result): `x1` the sender, `x2`..`x4` the words, `x5` bit 0 whether it is a call
+/// and bits 8..15 the capability that came with it (slot plus one, or `CAP_FAILED`), which is only given to a receiver that `accept`s one.
+fn deliver_regs(rcv: usize, m: &Msg, accept: bool) {
+    let info = match (accept, m.cap) {
+        (true, Some(c)) => install_cap(&mut task::lock(rcv), rcv, &c),
+        _ => 0,
+    };
     let mut f = frame(rcv);
     f.x[0] = 0;
     f.x[1] = m.sender as u64;
     f.x[2] = m.w[0];
     f.x[3] = m.w[1];
     f.x[4] = m.w[2];
-    f.x[5] = m.call as u64;
+    f.x[5] = m.call as u64 | info << 8;
 }
 
 pub enum SendErr {
@@ -293,7 +325,7 @@ pub fn send(cur: usize, e: u16, m: Msg) -> Result<(), SendErr> {
     let sync_call = m.call && m.tag == 0;
     if let Some(r) = ep.waiter.take() {
         let r = r as usize;
-        deliver_regs(r, &m);
+        deliver_regs(r, &m, ep.accepts);
         if m.call {
             link_call(r, &m);
         }
@@ -329,14 +361,14 @@ pub enum Recv {
 
 /// Receive on endpoint `e` for task `me`. On `Got` the message is already in `me`'s registers;
 /// on `Blocked` the task is registered and asleep in `RecvWait`.
-pub fn recv(me: usize, e: u16, block: bool) -> Recv {
+pub fn recv(me: usize, e: u16, block: bool, accept: bool) -> Recv {
     let mut ep = lock_ep(e);
     if ep.len > 0 {
         let m = ep.q[ep.head];
         ep.head = (ep.head + 1) % QLEN;
         ep.len -= 1;
         ep.refresh_best(e);
-        deliver_regs(me, &m);
+        deliver_regs(me, &m, accept);
         if m.call {
             link_call(me, &m);
         }
@@ -349,6 +381,7 @@ pub fn recv(me: usize, e: u16, block: bool) -> Recv {
         return Recv::Busy;
     }
     ep.waiter = Some(me as u16);
+    ep.accepts = accept;
     sched::set_state(me, State::RecvWait(e));
     Recv::Blocked
 }
@@ -369,7 +402,7 @@ pub fn defer(server: usize) -> Option<u64> {
 }
 
 /// Answer a caller parked by `defer`: false if it is gone, was not parked by `server`, or has moved on.
-pub fn reply_to(server: usize, token: u64, w: [u64; 3]) -> bool {
+pub fn reply_to(server: usize, token: u64, w: [u64; 3], cap: Option<Cap>) -> bool {
     if token >= task::limit() as u64 {
         return false;
     }
@@ -379,16 +412,26 @@ pub fn reply_to(server: usize, token: u64, w: [u64; 3]) -> bool {
         return false;
     }
     tc.callee = None;
+    let info = reply_cap(&mut tc, c, cap);
     let mut f = frame(c);
     f.x[0] = 0;
     f.x[1] = w[0];
     f.x[2] = w[1];
     f.x[3] = w[2];
+    f.x[4] = info;
     sched::wake_if(c, State::CallWait)
 }
 
+/// The capability a reply carries, given to the caller `c` (whose table `tc` the caller of this holds) if the call said it would take one.
+fn reply_cap(tc: &mut task::Task, c: usize, cap: Option<Cap>) -> u64 {
+    match cap {
+        Some(cp) if tc.reply_cap_ok => install_cap(tc, c, &cp),
+        _ => 0,
+    }
+}
+
 /// Reply from `server` to the caller it is currently serving.
-pub fn reply(server: usize, w: [u64; 3]) -> bool {
+pub fn reply(server: usize, w: [u64; 3], cap: Option<Cap>) -> bool {
     let link = task::lock(server).reply_to.take();
     let Some((c, tag)) = link else { return false };
     sched::clear_inherit(server);
@@ -401,10 +444,12 @@ pub fn reply(server: usize, w: [u64; 3]) -> bool {
         return false; // caller died or moved on
     }
     tc.callee = None;
+    let info = reply_cap(&mut tc, c, cap);
     let mut f = frame(c);
     f.x[0] = 0;
     f.x[1] = w[0];
     f.x[2] = w[1];
     f.x[3] = w[2];
+    f.x[4] = info;
     sched::wake_if(c, State::CallWait) // publishes the registers above
 }

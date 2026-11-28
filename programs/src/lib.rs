@@ -242,6 +242,77 @@ pub fn reply(w: [u64; 3]) -> i64 {
     svc(IPC_REPLY, w[0], w[1], w[2], 0, 0)[0] as i64
 }
 
+// ---- capabilities in messages -------------------------------------------------------------------------------------------------------------
+// A message can carry one capability, to a program that has no relation to the sender (the way a file descriptor crosses a socket): the sender names one of
+// its own capabilities that it holds the grant right on, and the rights the copy gets (they can only shrink); the receiver opts in per receive, and the copy
+// lands in its first free slot, hanging under the sender's capability, so revoking that revokes the copy. See the kernel's `cap_spec` and `docs/ABI.md`.
+
+const CAP_XFER: u64 = 1 << 62;
+const CAP_ACCEPT: u64 = 1 << 61;
+const RECV_ACCEPT: u64 = 2;
+/// `Received::Failed`: what the kernel says when a capability was sent and could not be given (no free slot, over the node allowance, revoked meanwhile).
+pub const CAP_FAILED: u64 = 0xFF;
+
+/// A capability to send: the slot in this program's table and the rights the copy will have.
+#[derive(Clone, Copy)]
+pub struct Give {
+    pub slot: u64,
+    pub rights: u16,
+}
+
+fn xfer(give: Option<Give>, accept: bool) -> u64 {
+    match give {
+        Some(g) => CAP_XFER | (g.slot + 1) | (g.rights as u64) << 8 | if accept { CAP_ACCEPT } else { 0 },
+        None if accept => CAP_XFER | CAP_ACCEPT,
+        None => 0,
+    }
+}
+
+/// What came with a message, for a receiver that asked for capabilities.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Received {
+    /// Nothing was sent (or the receiver did not ask).
+    None,
+    /// A copy is in this slot of the caller's table.
+    Slot(u64),
+    /// A capability was sent and could not be given.
+    Failed,
+}
+
+fn received(info: u64) -> Received {
+    match info & 0xFF {
+        0 => Received::None,
+        CAP_FAILED => Received::Failed,
+        n => Received::Slot(n - 1),
+    }
+}
+
+/// `recv`, taking the capability that comes with the message (if `accept`) into a free slot. The raw value kept in `info` is what `received` decodes.
+pub fn recv_cap(slot: u64, accept: bool) -> Result<(Msg, Received), i64> {
+    let r = svc(IPC_RECV, slot, if accept { RECV_ACCEPT } else { 0 }, 0, 0, 0);
+    if r[0] as i64 != 0 {
+        return Err(r[0] as i64);
+    }
+    Ok((Msg { sender: r[1], w: [r[2], r[3], r[4]], call: r[5] & 1 != 0 }, received(r[5] >> 8)))
+}
+
+/// `call` that may send a capability and, with `accept`, take one that comes with the reply. (status, reply words, what came with the reply; read the last
+/// only when the status is 0.)
+pub fn call_cap(slot: u64, w: [u64; 3], give: Option<Give>, accept: bool) -> (i64, [u64; 3], Received) {
+    let r = svc(IPC_CALL, slot, w[0], w[1], w[2], xfer(give, accept));
+    (r[0] as i64, [r[1], r[2], r[3]], if r[0] as i64 == 0 && accept { received(r[4]) } else { Received::None })
+}
+
+/// `IPC_SEND` (no reply, not waited for) with a capability.
+pub fn send_cap(slot: u64, w: [u64; 3], give: Give) -> i64 {
+    svc(IPC_SEND, slot, w[0], w[1], w[2], xfer(Some(give), false))[0] as i64
+}
+
+/// `reply` that may carry a capability to a caller that said it would take one.
+pub fn reply_cap(w: [u64; 3], give: Option<Give>) -> i64 {
+    svc(IPC_REPLY, w[0], w[1], w[2], xfer(give, false), 0)[0] as i64
+}
+
 /// What a program is started with.
 pub struct Ctx {
     pub arg: u64,

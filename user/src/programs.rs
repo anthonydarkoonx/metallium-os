@@ -1153,6 +1153,24 @@ pub fn tests() {
     destroy(ep as i64);
     let code = if b > 0 { wait(b, false) } else { b };
     println!("[client] TEST a caller waiting on an endpoint that ends is told so instead of waiting for ever (exit code {code}: 1000 + 4): {}", verdict(code == 1004));
+    // ---- capabilities in messages -------------------------------------------------------------------------------------------
+    // Two programs that are siblings (so CAP_GRANT between them is refused) share memory by sending capabilities through an endpoint: with the rights narrowed on the
+    // way, back in a reply, only to a receiver that asked, revoked with its source, refused when the receiver's table is full or the capability was revoked in the queue.
+    let captest = load("captest");
+    if captest.len() >= 32 {
+        let (nodes0, frames0) = (sysinfo(1)[5], sysinfo(0)[3]);
+        let cep = mk();
+        let server = Req::new().arg(0).heap(64).give_masked(0, cep as u8, 0b11).go(&captest);
+        let client = Req::new().arg(1).heap(64).give_masked(0, cep as u8, 0b01).go(&captest);
+        let cc = if client > 0 { wait(client, false) } else { client };
+        let sc = if server > 0 { wait(server, false) } else { server };
+        destroy(cep as i64);
+        sleep(3);
+        let (nodes1, frames1) = (sysinfo(1)[5], sysinfo(0)[3]);
+        println!("[client] TEST capabilities travel in messages between unrelated programs: rights narrow, a reply can carry one, only a receiver that asks is given one, a revoke follows the copy, and a full table or a revoked source is reported (client {cc}, server {sc}): {}", verdict(cc == 0 && sc == 0));
+        println!("[client] TEST every capability node and frame the capability-passing test used is back (nodes {nodes0} -> {nodes1}, frames {frames0} -> {frames1}): {}", verdict(nodes1 == nodes0 && frames1 + 8 >= frames0));
+    }
+
     // (a task may own 16 endpoints; the conductor's table of 32 capability slots has room for only some of them, so what stops it here is the table, `E_NOMEM`:
     // the quota itself is checked with many threads of one program by racetest mode 14)
     let eps: Vec<i64> = (0..17).map(|_| mk()).collect();
